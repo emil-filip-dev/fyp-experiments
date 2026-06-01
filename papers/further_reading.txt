@@ -1,0 +1,381 @@
+Further Reading — FYP: Shadow Mode RL for Chemical Process Control
+================================================================
+Organised by theme. URLs are arXiv/DOI links — verify before citing.
+Last updated: April 2026
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. SAFE RL & SHADOW MODE (Fallback / Intervention Mechanisms)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Garcia, J. & Fernandez, F. (2015)
+  "A Comprehensive Survey on Safe Reinforcement Learning"
+  Journal of Machine Learning Research, 16, 1437–1480
+  https://jmlr.org/papers/v16/garcia15a.html
+  [Foundational survey — taxonomises safe RL into teacher advice, shielding,
+   risk-sensitive objectives, constrained MDPs. Essential background.]
+
+Dalal, G., Dvijotham, K., Vecerik, M., Hester, T., Paduraru, C. & Tassa, Y. (2018)
+  "Safe Exploration in Continuous Action Spaces"
+  arXiv:1801.08757
+  https://arxiv.org/abs/1801.08757
+  [Adds a safety layer on top of any policy: projects actions onto safe set
+   via linear constraints. Closest prior work to shadow mode's intervention idea.]
+
+Wabersich, K.P. & Zeilinger, M.N. (2021)
+  "A Predictive Safety Filter for Learning-Based Control of Constrained Nonlinear
+   Dynamical Systems"
+  Automatica, 129, 109639
+  https://doi.org/10.1016/j.automatica.2021.109639
+  [MPC-based safety filter that overrides unsafe RL actions — conceptually
+   similar to Q-value switching but uses reachability analysis instead.]
+
+Brunke, L., Greeff, M., Hall, A.W., Yuan, Z., Zhou, S., Panerati, J. & Schoellig, A.P. (2022)
+  "Safe Learning in Robotics: From Learning-Based Control to Safe Reinforcement Learning"
+  Annual Review of Control, Robotics, and Autonomous Systems, 5, 411–444
+  https://doi.org/10.1146/annurev-control-042920-020211
+  [Excellent survey connecting CBF, MPC safety filters, and safe RL.
+   Useful for framing shadow mode within the robotics/control safety literature.]
+
+Pecka, M. & Svoboda, T. (2014)
+  "Safe Exploration Techniques for Reinforcement Learning — An Overview"
+  IROS Workshop on Modelling, Estimation, Perception and Control of All Terrain Mobile Robots
+  https://arxiv.org/abs/1412.2101
+  [Early survey of safe exploration methods; good historical context.]
+
+Thananjeyan, B., Balakrishna, A., Niekum, S., Luo, M., Srinivas, A. & Goldberg, K. (2021)
+  "Recovery RL: Safe Reinforcement Learning with Learned Recovery Zones"
+  IEEE RA-L 2021, arXiv:2010.15920
+  https://arxiv.org/abs/2010.15920
+  [Trains a recovery policy that takes over near constraint boundaries —
+   complementary to shadow mode: instead of reverting to baseline, it learns
+   a dedicated escape policy. Good ablation comparator.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. CONSTRAINED RL (CMDPs, Safety Constraints)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tessler, C., Mankowitz, D.J. & Mannor, S. (2018)
+  "Reward Constrained Policy Optimization"
+  ICLR 2019, arXiv:1805.11074
+  https://arxiv.org/abs/1805.11074
+  [RCPO: multi-timescale Lagrangian with penalty signal propagated through
+   the return. More stable than vanilla Lagrangian — strong baseline for
+   constraint-aware shadow mode (Extension 1).]
+
+Achiam, J., Held, D., Tamar, A. & Abbeel, P. (2017)
+  "Constrained Policy Optimization"
+  ICML 2017, arXiv:1705.10528
+  https://arxiv.org/abs/1705.10528
+  [CPO: first policy gradient algorithm with rigorous constraint satisfaction
+   guarantees. Solves constrained CMDP directly. Highly cited baseline.]
+
+Stooke, A., Achiam, J. & Abbeel, P. (2020)
+  "Responsive Safety in Reinforcement Learning by PID Lagrangian Methods"
+  ICML 2020, arXiv:2007.03964
+  https://arxiv.org/abs/2007.03964
+  [PID-Lagrangian: adaptive Lagrange multiplier via PID control law.
+   Dramatically stabilises Lagrangian RL — directly relevant to constraint
+   reward shaping in Extension 1.]
+
+Petsagkourakis, P., Sandoval, I.O., Bradford, E., Zhang, D. & del Rio-Chanona, E.A. (2020)
+  "Reinforcement Learning for Batch Bioprocess Optimization"
+  Computers & Chemical Engineering, 133, 106649
+  https://doi.org/10.1016/j.compchemeng.2019.106649
+  [Constrained RL for batch bioprocess — PSE application close to CSTR setting.
+   Uses Lagrangian penalty + DDPG.]
+
+Petsagkourakis, P., Sandoval, I.O., Bradford, E., Galvanin, F., Zhang, D. &
+del Rio-Chanona, E.A. (2022)
+  "Safe Policy Optimization with Local Gaussian Process Regression"
+  Computers & Chemical Engineering, 165, 107932
+  https://doi.org/10.1016/j.compchemeng.2022.107932
+  [Combines GP uncertainty with RL for safe exploration in PSE. Good companion
+   to Extension 3 (uncertainty-quantified switching).]
+
+Ray, A., Achiam, J. & Amodei, D. (2019)
+  "Benchmarking Safe Exploration in Deep Reinforcement Learning"
+  (Safety Gym paper)
+  https://arxiv.org/abs/1910.01708
+  [Introduces Safety Gym benchmark. Useful to compare against PC-Gym for
+   constraint satisfaction evaluation methodology.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. LEARNING TO DEFER (Human-AI / Expert-AI Teaming)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mozannar, H. & Sontag, D. (2020)
+  "Consistent Estimators for Learning to Defer to an Expert"
+  ICML 2020, arXiv:2006.01862
+  https://arxiv.org/abs/2006.01862
+  [Foundational L2D paper. Consistent surrogate loss for joint training of
+   classifier + deferral rule. One-shot (non-sequential) but key theoretical
+   foundation for SLTD.]
+
+Verma, R., Nalisnick, E. & Ghahramani, Z. (2022)
+  "Calibrated Learning to Defer with One-vs-All Classifiers"
+  ICML 2022
+  https://arxiv.org/abs/2206.10668
+  [Addresses calibration of deferral confidence. Directly relevant to
+   threshold η_agent in shadow mode's agent-decision switching mode.]
+
+Madras, D., Pitassi, T. & Zemel, R. (2018)
+  "Predict Responsibly: Improving Fairness and Accuracy of Imperfect Human
+   Annotations"
+  NeurIPS 2018
+  https://arxiv.org/abs/1711.04219
+  [Selectively defers to human annotator when ML model uncertain.
+   Predecessor framework to L2D.]
+
+Charusaie, M.A., Mozannar, H., Sontag, D. & Samadi, S. (2022)
+  "Sample Efficient Learning of Predictors that Complement Humans"
+  ICML 2022
+  https://arxiv.org/abs/2207.10153
+  [Extends L2D to the sample-efficient regime — relevant to PSE where data
+   collection on real plant is expensive.]
+
+Hemmer, P., Thede, L., Vössing, M. & Kühl, N. (2023)
+  "Toward Human-AI Collaboration in Sequential Decision Making"
+  arXiv:2307.04390
+  https://arxiv.org/abs/2307.04390
+  [Extends L2D to sequential settings with non-stationarity — direct bridge
+   between SLTD and shadow mode's deferral framing. Very recent and relevant.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. HYBRID RL + CLASSICAL CONTROL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Silver, T., Allen, K., Tenenbaum, J. & Kaelbling, L. (2018)
+  "Residual Policy Learning"
+  arXiv:1812.06298
+  https://arxiv.org/abs/1812.06298
+  [Train RL to output residual correction to a baseline policy (e.g. PID).
+   Alternative to shadow mode — complementary baseline for evaluation.]
+
+Johannink, T., Bahl, S., Nair, A., Luo, J., Kumar, A., Lober, M. & Levine, S. (2019)
+  "Residual Reinforcement Learning for Robot Control"
+  ICRA 2019, arXiv:1812.03201
+  https://arxiv.org/abs/1812.03201
+  [Residual RL applied to robotic manipulation. Demonstrates that RL on top
+   of a weak prior policy converges faster and more stably.]
+
+Lawrence, N.P., Forbes, M.G., Loewen, P.D., MacDonald, D.G., Backström, J.U. &
+Gopaluni, R.B. (2022)
+  "Deep Reinforcement Learning with Shallow Controllers: An Experimental Application
+   to PID Tuning"
+  Control Engineering Practice, 121, 105046
+  https://doi.org/10.1016/j.conengprac.2021.105046
+  [RL for online PID gain scheduling — alternative hybrid approach to CIRL.
+   Useful comparison point for Extension 2.]
+
+Dogru, O., Velswamy, K., Ibrahim, F., Wu, Y., Sundaramoorthy, A.S., Huang, B.,
+Xu, S., Nixon, M. & Bell, N. (2022)
+  "Reinforcement Learning Approach to Autonomous PID Tuning"
+  Computers & Chemical Engineering, 161, 107801
+  https://doi.org/10.1016/j.compchemeng.2022.107801
+  [RL-tuned PID on real industrial process (Emerson DeltaV). Demonstrates
+   practical deployment — useful motivation for why hybrid RL+PID matters.]
+
+Degrave, J., Felici, F., Buchli, J., et al. (2022)
+  "Magnetic Control of Tokamak Plasmas through Deep Reinforcement Learning"
+  Nature, 602, 414–419
+  https://doi.org/10.1038/s41586-021-04301-9
+  [Landmark real-world RL application in control of a physical system with
+   stringent safety constraints. Useful motivation for industrial deployment.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. CHEMICAL PROCESS CONTROL WITH RL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spielberg, S.P.K., Gopaluni, R.B. & Loewen, P.D. (2017)
+  "Deep Reinforcement Learning Approaches for Process Control"
+  ADCHEM 2017
+  https://doi.org/10.1016/j.ifacol.2017.08.1514
+  [One of the first demonstrations of deep RL (DQN, DDPG) for PID setpoint
+   control in process industries. Foundational PSE-RL paper.]
+
+Nian, R., Liu, J. & Huang, B. (2020)
+  "A Review on Reinforcement Learning: Introduction and Applications in
+   Industrial Process Control"
+  Computers & Chemical Engineering, 139, 106886
+  https://doi.org/10.1016/j.compchemeng.2020.106886
+  [Comprehensive review of RL in industrial process control up to 2020.
+   Good background for framing the FYP contribution.]
+
+Mowbray, M., Petsagkourakis, P., del Rio-Chanona, E.A. & Zhang, D. (2022)
+  "Safe Chance Constrained Reinforcement Learning for Batch Process Control"
+  Computers & Chemical Engineering, 157, 107630
+  https://doi.org/10.1016/j.compchemeng.2021.107630
+  [Chance-constraint approach to safe RL in batch processes — formally handles
+   probabilistic state constraints. Very relevant to Extension 1.]
+
+Bradford, E., Imsland, L., Zhang, D. & del Rio-Chanona, E.A. (2020)
+  "Stochastic Data-Driven Model Predictive Control Using Gaussian Processes"
+  Computers & Chemical Engineering, 139, 106844
+  https://doi.org/10.1016/j.compchemeng.2020.106844
+  [GP-MPC for process control — baseline comparator to shadow mode + MPC
+   safety filter combination in Extension 1.]
+
+Yang, S., Wan, M.P., Chen, W., Ng, B.F. & Dubey, S. (2021)
+  "Model-Based Safe Reinforcement Learning with Lyapunov Functions for
+   HVAC Control"
+  Energy and Buildings
+  https://doi.org/10.1016/j.enbuild.2021.111046
+  [Safe RL with Lyapunov function in a real building control system.
+   Practical deployment of safety constraints similar to our target.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. CONTROL BARRIER FUNCTIONS & LYAPUNOV SAFETY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Ames, A.D., Coogan, S., Egerstedt, M., Notomista, G., Sreenath, K. & Tabuada, P. (2019)
+  "Control Barrier Functions: Theory and Applications"
+  ECC 2019
+  https://doi.org/10.23919/ECC.2019.8796030
+  [Definitive CBF reference. CBF provides forward-invariance guarantee for
+   safe sets — formal alternative to shadow mode's heuristic switching.]
+
+Berkenkamp, F., Turchetta, M., Schoellig, A. & Krause, A. (2017)
+  "Safe Model-Based Reinforcement Learning with Stability Guarantees"
+  NeurIPS 2017, arXiv:1705.08551
+  https://arxiv.org/abs/1705.08551
+  [Lyapunov-based safe exploration with GP model. Provably safe RL with
+   formal stability certificate — key theoretical comparator.]
+
+Cheng, R., Orosz, G., Murray, R.M. & Burdick, J.W. (2019)
+  "End-to-End Safe Reinforcement Learning through Barrier Functions for
+   Safety-Critical Continuous Control Tasks"
+  AAAI 2019, arXiv:1903.08792
+  https://arxiv.org/abs/1903.08792
+  [CBF as differentiable safety layer in RL — trains the policy to respect
+   the CBF constraint via QP projection. Relevant to Extension 1.]
+
+Zhao, W., Queralta, J.P. & Westerlund, T. (2020)
+  "Sim-to-Real Transfer in Deep Reinforcement Learning for Robotics"
+  IEEE SSCI 2020
+  https://doi.org/10.1109/SSCI47803.2020.9308468
+  [Sim-to-real gap analysis — analogous concerns arise when deploying shadow
+   mode trained on PC-Gym simulated CSTR to real plant.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. MODEL-BASED RL & UNCERTAINTY QUANTIFICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Chua, K., Calandra, R., McAllister, R. & Levine, S. (2018)
+  "Deep Reinforcement Learning in a Handful of Trials using Probabilistic
+   Dynamics Models" (PETS)
+  NeurIPS 2018, arXiv:1805.12114
+  https://arxiv.org/abs/1805.12114
+  [PETS: ensemble of probabilistic NNs for dynamics model, CEM for planning.
+   Relevant to Extension 3 — ensemble approach for epistemic uncertainty.]
+
+Nagabandi, A., Kahn, G., Fearing, R.S. & Levine, S. (2018)
+  "Neural Network Dynamics for Model-Based Deep Reinforcement Learning with
+   Model-Free Fine-Tuning"
+  ICRA 2018, arXiv:1708.02596
+  https://arxiv.org/abs/1708.02596
+  [Hybrid MB+MF RL — train on model, fine-tune on real rollouts.
+   Useful for reducing sample complexity in PSE shadow mode training.]
+
+Lakshminarayanan, B., Pritzel, A. & Blundell, C. (2017)
+  "Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles"
+  NeurIPS 2017, arXiv:1612.01474
+  https://arxiv.org/abs/1612.01474
+  [Deep Ensembles: K randomised NNs for uncertainty estimation. Foundational
+   reference for Extension 3's ensemble Q-network approach.]
+
+Mohan, A., Mowbray, M., del Rio-Chanona, E.A. & Petsagkourakis, P. (2023)
+  "Model-Based Reinforcement Learning for CSTR Control: A Comparative Study"
+  Computer Aided Chemical Engineering
+  https://doi.org/10.1016/B978-0-443-15274-0.50109-X
+  [MBRL applied specifically to CSTR — directly comparable environment to
+   our PC-Gym implementation.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. OFFLINE RL & CONSERVATIVE METHODS (for pre-deployment safety)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Levine, S., Kumar, A., Tucker, G. & Fu, J. (2020)
+  "Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open
+   Problems"
+  arXiv:2005.01643
+  https://arxiv.org/abs/2005.01643
+  [Comprehensive offline RL review. Shadow mode naturally generates offline
+   data (from baseline) before the RL agent is deployed — offline pretraining
+   is a natural extension.]
+
+Kumar, A., Zhou, A., Tucker, G. & Levine, S. (2020)
+  "Conservative Q-Learning for Offline Reinforcement Learning" (CQL)
+  NeurIPS 2020, arXiv:2006.04779
+  https://arxiv.org/abs/2006.04779
+  [CQL: penalises Q-values of out-of-distribution actions. Prevents
+   extrapolation errors when training critic on baseline-dominated buffer
+   in shadow mode — highly relevant to implementation.]
+
+Kidambi, R., Rajeswaran, A., Netrapalli, P. & Joachims, T. (2020)
+  "MOReL: Model-Based Offline Reinforcement Learning"
+  NeurIPS 2020, arXiv:2005.05951
+  https://arxiv.org/abs/2005.05951
+  [Model-based offline RL with pessimistic planning — natural fit for
+   initialising shadow mode agent from historical plant data.]
+
+Yu, T., Thomas, G., Yu, L., Ermon, S., Zou, J., Levine, S., Finn, C. & Ma, T. (2020)
+  "MOPO: Model-Based Offline Policy Optimization"
+  NeurIPS 2020, arXiv:2005.13239
+  https://arxiv.org/abs/2005.13239
+  [MOPO: penalises uncertain model regions (using ensemble disagreement) —
+   same uncertainty signal as Extension 3 but for offline pretraining.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. ACTOR-CRITIC ALGORITHMS (Technical Background)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Lillicrap, T.P., Hunt, J.J., Pritzel, A., Heess, N., Erez, T., Tassa, Y., Silver, D.
+& Wierstra, D. (2016)
+  "Continuous Control with Deep Reinforcement Learning" (DDPG)
+  ICLR 2016, arXiv:1509.02971
+  https://arxiv.org/abs/1509.02971
+  [Original DDPG paper — the base algorithm used in shadow_mode.py.]
+
+Fujimoto, S., van Hoof, H. & Meger, D. (2018)
+  "Addressing Function Approximation Error in Actor-Critic Methods" (TD3)
+  ICML 2018, arXiv:1802.09477
+  https://arxiv.org/abs/1802.09477
+  [TD3: twin Q-networks + delayed policy updates to fix DDPG overestimation.
+   Drop-in upgrade to shadow_mode.py — worth testing as Extension.]
+
+Haarnoja, T., Zhou, A., Abbeel, P. & Levine, S. (2018)
+  "Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning
+   with a Stochastic Actor" (SAC)
+  ICML 2018, arXiv:1801.01290
+  https://arxiv.org/abs/1801.01290
+  [SAC: entropy-regularised RL with automatic temperature tuning. State of the
+   art off-policy algorithm; alternative to DDPG for shadow mode agent.]
+
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A. & Klimov, O. (2017)
+  "Proximal Policy Optimization Algorithms" (PPO)
+  arXiv:1707.06347
+  https://arxiv.org/abs/1707.06347
+  [Original PPO paper — on-policy baseline used in example_pcgym.py.
+   Cannot directly provide Q-values so not directly applicable to Q-value
+   switching mode, but relevant for agent-decision mode comparison.]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NOTE ON URLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All URLs are from training knowledge (cutoff August 2025) and have not been
+verified by live web access. arXiv links are generally stable; DOI links
+redirect to journal pages and may require institutional access. Verify each
+URL before including in a literature review or citing formally.
+
+For papers not on arXiv, search: https://scholar.google.com or
+https://semanticscholar.org using the full author + title string.

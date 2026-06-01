@@ -1,0 +1,8 @@
+- Compare Shadow mode with non-shadow mode RL for CSTR scenario
+- Explore why agent takeover rate decreases with episode and make a visualisation showing in which states the agent will take over as opposed to baseline
+- Explore constraint satisfaction for shadow mode RL
+- explore how much more stable shadow mode is compared to normal rl
+    - need to quantify this
+- how much faster does shadow mode learn compared to normal rl
+- see behaviour of the shadow mode rl early on should be comparable to baseline
+- do repetitions to show trend is consistent
