@@ -1,80 +1,74 @@
 """
 evaluate.py
 ===========
-Load, run, and compare trained RL models on a PC-Gym scenario.
+Run trained models (and the reference controllers) on a PC-Gym scenario and
+SERIALISE the raw per-step rollout outputs to disk. It does NOT plot or compute
+summary metrics — a separate (to-be-built) plotting/metrics utility loads these
+rollout files and produces figures + metric tables.
 
-Also exports run_episode, evaluate, and plot_training_curves for use by
-train.py and train_shadow.py.
+Each run records, per step: physical state (env.state), observation, executed
+action, the agent's proposed action, the PID baseline's action, reward, and the
+shadow takeover flag. N seeds per method are stacked and written as one .npz per
+method under outputs/rollouts/<scenario>/<timestamp>/, plus a manifest.json
+describing the scenario (timing, plot_config, setpoint schedule, method list).
 
-Standalone usage
-----------------
-  # Auto-discover all models saved under outputs/models/<scenario>/
-  .venv/Scripts/python evaluate.py --scenario cstr
+Reference controllers always included:
+  - PID         — the scenario's baseline controller acting on its own
+  - NMPC Oracle — do-mpc + IPOPT nonlinear MPC on the env's exact dynamics
+                  (best-achievable reference; disable with --no-oracle)
 
-  # Evaluate specific checkpoints
-  .venv/Scripts/python evaluate.py --scenario cstr \\
-      --models outputs/models/cstr/ddpg/best.pt \\
-               outputs/models/cstr/shadow_qvalue/best.pt
+Also exports run_episode and evaluate (reused by trainer.py).
 
-  # More evaluation seeds and a specific trajectory seed
-  .venv/Scripts/python evaluate.py --scenario cstr --n-seeds 20 --eval-seed 7
+Usage
+-----
+  # Auto-discover all models under outputs/models/<scenario>/ and write rollouts
+  .venv/Scripts/python evaluate.py --scenario cstr --n-seeds 20
 
-Output is written to outputs/runs/<scenario>/<timestamp>/
+  # Specific checkpoints, no oracle
+  .venv/Scripts/python evaluate.py --scenario cstr --no-oracle \\
+      --models outputs/models/cstr/ddpg/best.pt
+
+Output: outputs/rollouts/<scenario>/<timestamp>/  (<method>.npz + manifest.json)
 """
 
 import argparse
+import copy
 import glob
+import io
+import json
 import os
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from stable_baselines3 import DDPG as SB3DDPG
-from stable_baselines3 import PPO, TD3
+from stable_baselines3 import TD3 as SB3TD3
 
-from models import ShadowDDPG, ShadowTD3
+from models import (
+    PureDDPG,
+    PureTD3,
+    ShadowDDPG,
+    ShadowSB3DDPG,
+    ShadowSB3TD3,
+    ShadowTD3,
+)
 from scenarios import SCENARIOS, make_env_for
 
 
 # ---------------------------------------------------------------------------
-# PureDDPG — agent always acts, defined here so evaluate.py and train.py
-# are both self-contained without a shared dependency between them
-# ---------------------------------------------------------------------------
-
-class PureDDPG(ShadowDDPG):
-    """Standard DDPG: always executes the agent's action, no switching."""
-
-    def decide_action(self, obs, baseline_action, training=True):
-        noise = (
-            np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
-            if training else np.zeros(self.action_dim, dtype=np.float32)
-        )
-        action_agent, _ = self._get_agent_action(obs)
-        action_noisy = np.clip(action_agent + noise, -1.0, 1.0)
-        self.agent_takeover_count += 1
-        return action_noisy, True, action_noisy
-
-
-# ---------------------------------------------------------------------------
-# SB3 adapter — wraps a Stable Baselines 3 model so it works in run_episode
+# SB3 adapters — make a loaded SB3 model usable by the rollout recorder
 # ---------------------------------------------------------------------------
 
 class _SB3Adapter:
-    """
-    Thin wrapper making a loaded SB3 model compatible with run_episode().
-    The agent always applies its own action (no shadow switching).
-    """
+    """Plain SB3 model wrapper — always applies its own action (no switching)."""
 
-    def __init__(self, sb3_model):
-        self._model          = sb3_model
-        self.total_steps     = 0
-        self.warmup_steps    = 0
+    def __init__(self, model):
+        self._model           = model
+        self.total_steps      = 0
+        self.warmup_steps     = 0
         self.max_t_train_frac = 0.0
-        self.action_dim      = sb3_model.action_space.shape[0]
+        self.action_dim       = model.action_space.shape[0]
 
     def decide_action(self, obs, baseline_action, training=False):
         action, _ = self._model.predict(obs, deterministic=True)
@@ -85,6 +79,107 @@ class _SB3Adapter:
     def reset(self):         pass
 
 
+class _ShadowSB3Adapter(_SB3Adapter):
+    """Shadow SB3 model wrapper — q-value switching vs the passed baseline action."""
+
+    def decide_action(self, obs, baseline_action, training=False):
+        a_agent, _ = self._model.predict(obs, deterministic=True)
+        obs_2d     = np.asarray(obs, dtype=np.float32)[None]
+        q_agent    = self._model._q1(obs_2d, np.asarray(a_agent)[None])[0]
+        q_baseline = self._model._q1(obs_2d, np.asarray(baseline_action)[None])[0]
+        if q_agent > q_baseline:
+            return a_agent, True, a_agent
+        return baseline_action, False, a_agent
+
+
+# ---------------------------------------------------------------------------
+# NMPC oracle — receding-horizon do-mpc controller (best-achievable reference)
+# ---------------------------------------------------------------------------
+
+class NMPCController:
+    """
+    Nonlinear MPC oracle for a PC-Gym scenario.
+
+    Built on PC-Gym's own do-mpc `oracle` (CasADi + IPOPT) so the prediction
+    model is *exactly* the environment's dynamics — the "best achievable"
+    reference. Exposes .predict(obs) / .reset() like the PID baselines and runs
+    in true receding-horizon fashion against the real (noisy) environment.
+    """
+
+    def __init__(self, cfg: dict, horizon: int = 20):
+        # Imported lazily so --no-oracle runs never pay the do-mpc import cost.
+        from pcgym import make_env
+        from pcgym.oracle import oracle
+
+        # oracle mutates env_params in place, so hand it a private copy.
+        env_params = copy.deepcopy(cfg["env_params"])
+        self._oracle = oracle(make_env, env_params, MPC_params={"N": horizon})
+
+        self._nx          = self._oracle.env.Nx_oracle
+        self._a_low       = np.asarray(env_params["a_space"]["low"],  dtype=np.float64)
+        self._a_high      = np.asarray(env_params["a_space"]["high"], dtype=np.float64)
+        self._o_low       = np.asarray(env_params["o_space"]["low"],  dtype=np.float64)
+        self._o_high      = np.asarray(env_params["o_space"]["high"], dtype=np.float64)
+        self._normalise_o = env_params.get("normalise_o", True)
+        self._x0          = np.asarray(cfg["env_params"]["x0"][:self._nx], dtype=np.float64)
+
+        # Build the NLP once; reset() re-initialises it cheaply each episode.
+        with redirect_stdout(io.StringIO()):
+            self._mpc, _ = self._oracle.setup_mpc()
+
+        # PC-Gym's shipped p_fun does `int(t_now/dt - 1)`, which crashes on modern
+        # numpy (do-mpc passes t_now as a 1-D array) and lags the setpoint by one
+        # step. make_step looks up self.p_fun dynamically, so we override it with a
+        # scalar-safe version that tracks the *current* setpoint. Only setpoint
+        # scheduling is supported (no disturbances / delta-u).
+        if self._oracle.has_disturbances or self._oracle.use_delta_u:
+            raise NotImplementedError(
+                "NMPCController supports setpoint-tracking scenarios only "
+                "(no disturbances or delta-u)."
+            )
+        self._mpc.p_fun = self._make_p_fun()
+        self.reset()
+
+    def _make_p_fun(self):
+        """Build a scalar-safe do-mpc parameter function for setpoint tracking."""
+        sp_dict        = self._oracle.env_params["SP"]
+        sp_arrays      = [np.asarray(v, dtype=float) for v in sp_dict.values()]
+        dt             = self._oracle.env.dt
+        get_p_template = self._mpc.get_p_template
+
+        def p_fun(t_now):
+            t = float(np.asarray(t_now).flatten()[0])
+            k = int(round(t / dt))                       # current step index
+            p_template = get_p_template(1)
+            sp_vals = [arr[min(k, len(arr) - 1)] for arr in sp_arrays]
+            p_template["_p", 0, "SP"] = np.array(sp_vals).reshape(-1, 1)
+            return p_template
+
+        return p_fun
+
+    def reset(self):
+        """Restart for a new episode: reset the MPC clock and initial guess."""
+        self._mpc.reset_history()            # resets internal t0 -> 0 (SP indexing)
+        self._mpc.x0 = self._x0
+        with redirect_stdout(io.StringIO()):
+            self._mpc.set_initial_guess()
+
+    def predict(self, obs, deterministic: bool = True):
+        obs = np.asarray(obs, dtype=np.float64)
+        if self._normalise_o:
+            phys = (obs + 1.0) / 2.0 * (self._o_high - self._o_low) + self._o_low
+        else:
+            phys = obs
+        x0 = phys[:self._nx].reshape(-1, 1)        # physical model state (no setpoints)
+
+        with redirect_stdout(io.StringIO()):
+            u = np.asarray(self._mpc.make_step(x0)).flatten()   # physical input(s)
+
+        # Re-normalise to the env's [-1, 1] action space.
+        u_norm = 2.0 * (u - self._a_low) / (self._a_high - self._a_low) - 1.0
+        return np.clip(u_norm, -1.0, 1.0).astype(np.float32), None
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
@@ -93,52 +188,63 @@ def _label_from_path(checkpoint_path: str) -> str:
     """Human-readable label inferred from the checkpoint's parent directory."""
     name = Path(checkpoint_path).parent.name
 
-    # Exact matches for standard SB3 models
-    exact = {"ddpg": "DDPG", "td3": "TD3", "ppo": "PPO"}
+    # Exact matches for the standard (no-shadow) custom agents
+    exact = {"ddpg": "DDPG", "td3": "TD3"}
     if name in exact:
         return exact[name]
 
-    # Shadow model names: shadow_<model>_<mode>[_reg<λ>]
+    # SB3 backend (check before the generic shadow_ branch — shadow_sb3_* also
+    # starts with "shadow_").
+    if name.startswith("shadow_sb3_"):
+        return f"Shadow SB3 {'TD3' if 'td3' in name else 'DDPG'}"
+    if name.startswith("sb3_"):
+        return f"SB3 {'TD3' if 'td3' in name else 'DDPG'}"
+
+    # Shadow model names: shadow_<model>_<mode>[_reg<lambda>]
     if name.startswith("shadow_"):
         parts = name[len("shadow_"):]          # e.g. "td3_qvalue" or "ddpg_agent_reg2.0"
         model = parts.split("_")[0].upper()    # DDPG or TD3
         if "agent_reg" in parts:
             lam = parts.split("agent_reg")[-1]
-            return f"Shadow {model} (Agent, λ={lam})"
+            return f"Shadow {model} (Agent, lambda={lam})"
         if "agent" in parts:
             return f"Shadow {model} (Agent)"
         return f"Shadow {model} (Q-value)"
+
+    # Pure (no-shadow) custom ablation: pure_<model>
+    if name.startswith("pure_"):
+        model = "TD3" if "td3" in name else "DDPG"
+        return f"{model} (no shadow)"
 
     return name
 
 
 def load_model(checkpoint_path: str, state_dim: int, action_dim: int):
     """
-    Load a trained model from a checkpoint file.
-
-    Accepts both:
-      *.pt        — custom ShadowDDPG / ShadowTD3 / PureDDPG checkpoints
-      *.zip       — SB3 (DDPG / TD3 / PPO) checkpoints saved by train.py
-
-    The model type is inferred from the checkpoint's parent directory name.
+    Load a trained model from a checkpoint, inferred from its parent dir name:
+      *.pt   — custom Shadow{DDPG,TD3} / Pure{DDPG,TD3}
+      *.zip  — SB3 backend: plain SB3 DDPG/TD3, or Shadow SB3 DDPG/TD3
     """
-    name = Path(checkpoint_path).parent.name.lower()
-    ext  = Path(checkpoint_path).suffix.lower()
+    name   = Path(checkpoint_path).parent.name.lower()
+    ext    = Path(checkpoint_path).suffix.lower()
+    is_td3 = "td3" in name
 
-    if ext == ".zip":
-        if "ppo" in name:
-            return _SB3Adapter(PPO.load(checkpoint_path))
-        if "td3" in name:
-            return _SB3Adapter(TD3.load(checkpoint_path))
-        return _SB3Adapter(SB3DDPG.load(checkpoint_path))
+    if ext == ".zip":        # SB3 backend
+        if "shadow" in name:
+            cls = ShadowSB3TD3 if is_td3 else ShadowSB3DDPG
+            return _ShadowSB3Adapter(cls.load(checkpoint_path))
+        cls = SB3TD3 if is_td3 else SB3DDPG
+        return _SB3Adapter(cls.load(checkpoint_path))
 
-    # .pt — custom shadow-mode or pure-DDPG checkpoint
+    # .pt — custom core. Check "shadow" before "td3" so a no-shadow td3 maps to
+    # PureTD3, not ShadowTD3.
     mode = "agent" if "agent" in name else "qvalue"
 
-    if "td3" in name:
+    if "shadow" not in name:        # pure / no-shadow custom ablation
+        cls   = PureTD3 if is_td3 else PureDDPG
+        agent = cls(state_dim=state_dim, action_dim=action_dim, mode="qvalue")
+    elif is_td3:
         agent = ShadowTD3(state_dim=state_dim, action_dim=action_dim, mode=mode)
-    elif "shadow" not in name:
-        agent = PureDDPG(state_dim=state_dim, action_dim=action_dim, mode="qvalue")
     else:
         agent = ShadowDDPG(state_dim=state_dim, action_dim=action_dim, mode=mode)
 
@@ -148,8 +254,8 @@ def load_model(checkpoint_path: str, state_dim: int, action_dim: int):
 
 def discover_models(scenario: str, models_dir: str = "outputs/models") -> list[str]:
     """
-    Return all checkpoint paths found under models_dir/<scenario>/*/,
-    accepting both best.pt (custom) and best_model.zip (SB3 EvalCallback).
+    Return all checkpoint paths under models_dir/<scenario>/*/ — best.pt (custom
+    core) and best_model.zip (SB3 backend).
     """
     paths = []
     for pattern in ("best.pt", "best_model.zip"):
@@ -158,14 +264,14 @@ def discover_models(scenario: str, models_dir: str = "outputs/models") -> list[s
 
 
 # ---------------------------------------------------------------------------
-# Episode runner  (also used by train.py and train_shadow.py)
+# Episode runner + evaluator  (reused by trainer.py)
 # ---------------------------------------------------------------------------
 
 def run_episode(env, agent, baseline, training: bool,
                 seed: int, n_steps: int) -> tuple[float, list[bool]]:
     """
-    Run one full episode.  Compatible with any scenario and any ShadowDDPG
-    instance (including PureDDPG subclass).
+    Run one full episode. Compatible with any scenario and any ShadowDDPG-like
+    instance (Pure* / Shadow* / SB3 adapters).
 
     Returns
     -------
@@ -217,10 +323,6 @@ def run_episode(env, agent, baseline, training: bool,
     return total_reward, agent_flags
 
 
-# ---------------------------------------------------------------------------
-# Evaluator  (also used by train.py and train_shadow.py)
-# ---------------------------------------------------------------------------
-
 def evaluate(env, agent, baseline, n_seeds: int, n_steps: int) -> float:
     """Mean reward over n_seeds deterministic evaluation episodes."""
     rewards = [
@@ -231,315 +333,170 @@ def evaluate(env, agent, baseline, n_seeds: int, n_steps: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Training-curve plotter  (used by train.py and train_shadow.py)
+# Rollout recorder + writer  (the sole job of this module's CLI)
 # ---------------------------------------------------------------------------
 
-def plot_training_curves(
-    rewards_log:   list[tuple[int, float]],
-    eval_log:      list[tuple[int, float]],
-    save_path:     str,
-    scenario:      str,
-    run_label:     str,
-    agent_pct_log: list[float] | None = None,
-):
+def _record_rollout(env, controller, scenario_baseline, seed: int,
+                    n_steps: int) -> dict:
     """
-    Save a training-curve figure to save_path/training_curves.png.
-    Renders 2 panels for standard DDPG or 3 panels (adds agent takeover %)
-    when agent_pct_log is provided (shadow mode).
+    Run one deterministic episode, recording the full per-step model outputs.
+
+    `controller` may be an RL agent (has .decide_action) or a plain controller
+    (PID / NMPC, .predict only). `scenario_baseline` is the scenario's PID, used
+    both as the shadow switching reference and to record a consistent baseline
+    action column for every method.
+
+    Returns arrays of shape [T, ...] (T = episode length):
+      states, obs, actions, actions_agent, actions_baseline, rewards, takeover
+    `takeover` is 1.0 (agent) / 0.0 (baseline) for RL agents, NaN otherwise.
     """
-    n_panels = 3 if agent_pct_log is not None else 2
-    fig, axes = plt.subplots(n_panels, 1, figsize=(12, 4 * n_panels), sharex=False)
-
-    steps, rews = zip(*rewards_log) if rewards_log else ([0], [0])
-    window = 50
-
-    ax = axes[0]
-    ax.plot(steps, rews, alpha=0.25, color="steelblue", linewidth=0.7)
-    if len(rews) >= window:
-        ma = np.convolve(rews, np.ones(window) / window, mode="valid")
-        ax.plot(steps[window - 1:], ma, color="steelblue", linewidth=2,
-                label=f"MA({window})")
-    ax.set_ylabel("Episode Reward")
-    ax.set_title(f"{scenario} / {run_label} — Training Reward")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1]
-    if eval_log:
-        es, er = zip(*eval_log)
-        ax.plot(es, er, "o-", color="green", linewidth=2, markersize=4)
-    ax.set_ylabel("Eval Reward (mean 5 seeds)")
-    ax.set_title("Evaluation Reward")
-    ax.grid(True, alpha=0.3)
-
-    if agent_pct_log is not None:
-        ax = axes[2]
-        ax.plot(agent_pct_log, color="red", alpha=0.4, linewidth=0.7)
-        if len(agent_pct_log) >= window:
-            ma = np.convolve(agent_pct_log, np.ones(window) / window, mode="valid")
-            ax.plot(range(window - 1, len(agent_pct_log)), ma, color="red", linewidth=2)
-        ax.set_ylabel("Agent Control (%)")
-        ax.set_xlabel("Episode")
-        ax.set_title("Agent Takeover Fraction")
-        ax.set_ylim(0, 100)
-        ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    out = os.path.join(save_path, "training_curves.png")
-    plt.savefig(out, dpi=150)
-    plt.close()
-    print(f"  [Plot] {out}")
-
-
-# ---------------------------------------------------------------------------
-# Trajectory recorder  (evaluation-only, captures physical env.state)
-# ---------------------------------------------------------------------------
-
-def _record_trajectory(env, agent_or_baseline, baseline, seed: int,
-                        n_steps: int) -> dict:
-    """
-    Run one deterministic episode, recording the physical state at every step.
-
-    If agent_or_baseline is a baseline controller (has .predict but no
-    .decide_action), it is run directly.  Otherwise it is run as an RL agent
-    in evaluation mode with the baseline alongside for switching.
-
-    Returns a dict with keys:
-      states   : np.ndarray [T, n_physical_states]  — env.state each step
-      rewards  : np.ndarray [T]
-      total    : float
-    """
-    is_agent = hasattr(agent_or_baseline, "decide_action")
+    is_agent = hasattr(controller, "decide_action")
 
     obs, _ = env.reset(seed=seed)
-    if hasattr(agent_or_baseline, "reset"):
-        agent_or_baseline.reset()
-    baseline.reset()
+    if hasattr(controller, "reset"):
+        controller.reset()
+    scenario_baseline.reset()
 
-    states_list:  list = []
-    rewards_list: list = []
-    done = False
-    step = 0
+    states, observations = [], []
+    a_exec_l, a_agent_l, a_base_l = [], [], []
+    rewards, takeover = [], []
+    done, step = False, 0
 
     while not done and step < n_steps:
+        a_baseline, _ = scenario_baseline.predict(obs)
+        a_baseline = np.asarray(a_baseline, dtype=np.float32)
+
         if is_agent:
-            a_baseline, _ = baseline.predict(obs)
-            a_exec, _, _  = agent_or_baseline.decide_action(
+            a_exec, used_agent, a_agent = controller.decide_action(
                 obs, a_baseline, training=False
             )
+            a_exec  = np.asarray(a_exec,  dtype=np.float32)
+            a_agent = np.asarray(a_agent, dtype=np.float32)
+            tk = 1.0 if used_agent else 0.0
         else:
-            a_exec, _ = agent_or_baseline.predict(obs)
+            a_exec, _ = controller.predict(obs)
+            a_exec  = np.asarray(a_exec, dtype=np.float32)
+            a_agent = a_exec.copy()
+            tk = float("nan")          # takeover not applicable
 
+        observations.append(np.asarray(obs, dtype=np.float32))
         obs, reward, terminated, truncated, _ = env.step(a_exec)
         done = terminated or truncated
-        states_list.append(env.state.copy())
-        rewards_list.append(reward)
+
+        states.append(env.state.copy().astype(np.float32))
+        a_exec_l.append(a_exec)
+        a_agent_l.append(a_agent)
+        a_base_l.append(a_baseline)
+        rewards.append(float(reward))
+        takeover.append(tk)
         step += 1
 
-    states  = np.array(states_list)
-    rewards = np.array(rewards_list)
-    return {"states": states, "rewards": rewards, "total": float(rewards.sum())}
+    return {
+        "states":           np.asarray(states,        dtype=np.float32),
+        "obs":              np.asarray(observations,  dtype=np.float32),
+        "actions":          np.asarray(a_exec_l,      dtype=np.float32),
+        "actions_agent":    np.asarray(a_agent_l,     dtype=np.float32),
+        "actions_baseline": np.asarray(a_base_l,      dtype=np.float32),
+        "rewards":          np.asarray(rewards,       dtype=np.float32),
+        "takeover":         np.asarray(takeover,      dtype=np.float32),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Comparison runner
-# ---------------------------------------------------------------------------
+def _stack_episodes(episodes: list[dict]) -> dict:
+    """Stack a list of per-episode [T,...] dicts into [N, T, ...] (truncate to min T)."""
+    t_min = min(e["rewards"].shape[0] for e in episodes)
+    return {k: np.stack([e[k][:t_min] for e in episodes], axis=0)
+            for k in episodes[0]}
 
-def run_comparison(
+
+def run_rollouts(
     scenario:    str,
     model_paths: list[str],
-    n_seeds:     int = 10,
-    eval_seed:   int = 42,
-    models_dir:  str = "outputs/models",
-    output_dir:  str = "outputs/runs",
+    n_seeds:     int  = 10,
+    use_oracle:  bool = True,
+    mpc_horizon: int  = 20,
+    models_dir:  str  = "outputs/models",
+    output_dir:  str  = "outputs/rollouts",
 ):
     """
-    Evaluate a list of models (plus the scenario baseline) on the given scenario,
-    then write a comparison plot and results summary to output_dir/<scenario>/<timestamp>/.
-
-    Parameters
-    ----------
-    scenario    : key in SCENARIOS
-    model_paths : list of checkpoint paths; pass [] to auto-discover
-    n_seeds     : number of seeds for reward statistics
-    eval_seed   : seed used for the trajectory plot
-    models_dir  : root directory where model checkpoints are stored
-    output_dir  : root directory for run outputs
+    Run every method (PID, NMPC oracle, and the given/discovered models) on the
+    scenario for `n_seeds` seeds, serialising the raw rollouts to
+    output_dir/<scenario>/<timestamp>/ as one .npz per method + manifest.json.
+    No plotting or metric computation — that is the plotting utility's job.
     """
     cfg     = SCENARIOS[scenario]
     n_steps = cfg["n_steps"]
-    env_fn  = lambda: make_env_for(scenario)
 
     if not model_paths:
         model_paths = discover_models(scenario, models_dir)
         if not model_paths:
             print(f"  No models found under {models_dir}/{scenario}/. "
-                  "Train some models first.")
-            return
+                  "Recording reference controllers only.")
 
-    # Build list of (label, agent-or-baseline) entries; baseline is always first
-    entries: list[tuple[str, object]] = [("Baseline", cfg["baseline_cls"]())]
+    # (slug, label, controller). References first.
+    entries: list[tuple[str, str, object]] = [("pid", "PID", cfg["baseline_cls"]())]
+    if use_oracle:
+        print(f"  Building NMPC oracle (do-mpc + IPOPT, horizon={mpc_horizon})...")
+        entries.append(("nmpc_oracle", "NMPC Oracle", NMPCController(cfg, horizon=mpc_horizon)))
     for path in model_paths:
-        label = _label_from_path(path)
-        agent = load_model(path, cfg["state_dim"], cfg["action_dim"])
-        entries.append((label, agent))
+        slug  = Path(path).parent.name
+        entries.append((slug, _label_from_path(path),
+                        load_model(path, cfg["state_dim"], cfg["action_dim"])))
 
-    print(f"\n{'='*62}")
-    print(f"  Scenario  : {scenario}")
-    print(f"  Models    : {len(entries) - 1} loaded + baseline")
-    print(f"  Eval seeds: {n_seeds}  |  trajectory seed: {eval_seed}")
-    print(f"{'='*62}\n")
-
-    # Multi-seed reward statistics
-    eval_env  = env_fn()
-    baseline  = cfg["baseline_cls"]()
-    stats: dict[str, dict] = {}
-
-    for label, agent in entries:
-        rewards = []
-        for s in range(n_seeds):
-            if label == "Baseline":
-                obs, _ = eval_env.reset(seed=s)
-                agent.reset()
-                total = 0.0
-                done  = False
-                while not done:
-                    a, _ = agent.predict(obs)
-                    obs, r, terminated, truncated, _ = eval_env.step(a)
-                    done   = terminated or truncated
-                    total += r
-                rewards.append(total)
-            else:
-                r, _ = run_episode(eval_env, agent, baseline,
-                                   training=False, seed=s, n_steps=n_steps)
-                rewards.append(r)
-        arr = np.array(rewards)
-        stats[label] = {"mean": float(arr.mean()), "std": float(arr.std()),
-                        "rewards": arr}
-        print(f"  {label:<30}  mean={arr.mean():9.1f}  std={arr.std():7.1f}")
-
-    # Trajectory for the plot seed
-    traj_env = env_fn()
-    trajectories: dict[str, dict] = {}
-    for label, agent in entries:
-        trajectories[label] = _record_trajectory(
-            traj_env, agent, baseline, seed=eval_seed, n_steps=n_steps
-        )
-
-    # Save outputs
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir  = os.path.join(output_dir, scenario, timestamp)
     os.makedirs(save_dir, exist_ok=True)
 
-    _write_results(stats, scenario, n_seeds, eval_seed, save_dir)
-    _plot_comparison(trajectories, stats, cfg, scenario, eval_seed, save_dir)
+    print(f"\n{'='*62}")
+    print(f"  Scenario : {scenario}   |   methods: {len(entries)}   |   seeds: {n_seeds}")
+    print(f"  Output   : {save_dir}")
+    print(f"{'='*62}\n")
 
-    print(f"\n  Results written to {save_dir}")
+    env               = make_env_for(scenario)
+    scenario_baseline = cfg["baseline_cls"]()   # shadow switching + baseline column
+    methods_meta: list[dict] = []
 
+    for slug, label, controller in entries:
+        episodes = [
+            _record_rollout(env, controller, scenario_baseline, seed=s, n_steps=n_steps)
+            for s in range(n_seeds)
+        ]
+        data = _stack_episodes(episodes)
+        meta = {"slug": slug, "label": label, "scenario": scenario,
+                "n_seeds": n_seeds, "seeds": list(range(n_seeds))}
+        npz_path = os.path.join(save_dir, f"{slug}.npz")
+        np.savez(npz_path, meta=np.array(json.dumps(meta)), **data)
 
-# ---------------------------------------------------------------------------
-# Output writers
-# ---------------------------------------------------------------------------
+        mean_total = float(np.mean(data["rewards"].sum(axis=1)))
+        print(f"  {label:<28}  mean total reward = {mean_total:9.1f}   -> {slug}.npz")
+        methods_meta.append({"slug": slug, "label": label, "file": f"{slug}.npz"})
 
-def _write_results(stats: dict, scenario: str, n_seeds: int,
-                   eval_seed: int, save_dir: str):
-    baseline_mean = stats.get("Baseline", {}).get("mean", 0.0)
-    lines = [
-        f"Scenario    : {scenario}",
-        f"Eval seeds  : {n_seeds}",
-        f"Traj. seed  : {eval_seed}",
-        f"Timestamp   : {datetime.now().isoformat(timespec='seconds')}",
-        "",
-        f"{'Model':<32} {'Mean Reward':>12} {'Std':>8} {'vs Baseline':>12}",
-        "-" * 68,
-    ]
-    for label, s in stats.items():
-        delta = s["mean"] - baseline_mean if label != "Baseline" else 0.0
-        delta_str = f"{delta:+.1f}" if label != "Baseline" else "—"
-        lines.append(
-            f"{label:<32} {s['mean']:>12.1f} {s['std']:>8.1f} {delta_str:>12}"
-        )
-    text = "\n".join(lines) + "\n"
+    # Manifest: everything the plotting utility needs to interpret the .npz files.
+    manifest = {
+        "scenario":    scenario,
+        "timestamp":   timestamp,
+        "n_seeds":     n_seeds,
+        "n_steps":     n_steps,
+        "tsim":        cfg["env_params"]["tsim"],
+        "dt":          cfg["env_params"]["tsim"] / cfg["env_params"]["N"],
+        "plot_config": cfg["plot_config"],
+        "setpoints":   {k: list(map(float, v)) for k, v in cfg["env_params"]["SP"].items()},
+        "methods":     methods_meta,
+        "array_schema": {
+            "states":           "[N, T, n_physical_states]  env.state each step (physical)",
+            "obs":              "[N, T, obs_dim]            normalised observation",
+            "actions":          "[N, T, action_dim]         executed action (normalised)",
+            "actions_agent":    "[N, T, action_dim]         agent's proposed action",
+            "actions_baseline": "[N, T, action_dim]         PID baseline action",
+            "rewards":          "[N, T]                     per-step reward",
+            "takeover":         "[N, T]                     1=agent, 0=baseline, NaN=N/A",
+        },
+    }
+    with open(os.path.join(save_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
 
-    out = os.path.join(save_dir, "results.txt")
-    with open(out, "w") as f:
-        f.write(text)
-    print(f"  [Results] {out}")
-    print()
-    print(text)
-
-
-def _plot_comparison(trajectories: dict, stats: dict, cfg: dict,
-                     scenario: str, eval_seed: int, save_dir: str):
-    plot_config = cfg["plot_config"]
-    n_outputs   = len(plot_config)
-    tsim        = cfg["env_params"]["tsim"]
-    n_steps     = cfg["n_steps"]
-    time_axis   = np.linspace(0, tsim, n_steps)
-
-    # Generate one colour per entry; tab10 cycles cleanly for up to 10,
-    # beyond that we tile it so no entry is ever silently dropped.
-    n_entries = len(trajectories)
-    cmap      = plt.get_cmap("tab10")
-    colours   = [cmap(i % 10) for i in range(n_entries)]
-
-    fig, axes = plt.subplots(n_outputs + 1, 1,
-                             figsize=(13, 4 * (n_outputs + 1)), sharex=False)
-    if n_outputs + 1 == 1:
-        axes = [axes]
-
-    # --- Trajectory panels ---
-    for panel_idx, pc in enumerate(plot_config):
-        ax      = axes[panel_idx]
-        si      = pc["state_idx"]
-        sp_i    = pc["sp_idx"]
-        label_y = f"{pc['label']} ({pc['unit']})"
-
-        # Setpoint from baseline trajectory (all models see the same setpoint)
-        sp_traj = trajectories["Baseline"]["states"][:, sp_i]
-        t_sp    = time_axis[:len(sp_traj)]
-        ax.plot(t_sp, sp_traj, "k--", linewidth=1.8, label="Setpoint", zorder=5)
-
-        for colour, (name, traj) in zip(colours, trajectories.items()):
-            y = traj["states"][:, si]
-            t = time_axis[:len(y)]
-            ax.plot(t, y, linewidth=1.8, color=colour,
-                    label=f"{name}  (reward {traj['total']:.0f})")
-
-        ax.set_ylabel(label_y, fontsize=11)
-        ax.set_title(f"{scenario} — {pc['label']} tracking  (seed={eval_seed})",
-                     fontsize=11)
-        ax.legend(loc="best", fontsize=9)
-        ax.grid(True, alpha=0.3)
-
-    # --- Reward bar chart ---
-    ax      = axes[n_outputs]
-    labels  = list(stats.keys())
-    means   = [stats[l]["mean"] for l in labels]
-    stds    = [stats[l]["std"]  for l in labels]
-
-    bar_colours = [cmap(i % 10) for i in range(len(labels))]
-    bars = ax.bar(labels, means, yerr=stds, capsize=5,
-                  color=bar_colours, alpha=0.85, edgecolor="black")
-    for bar, mean in zip(bars, means):
-        # For negative bars, place label below the bar bottom; for positive, above top
-        y = bar.get_height()
-        offset = abs(y) * 0.02 if y >= 0 else -abs(y) * 0.02
-        va = "bottom" if y >= 0 else "top"
-        ax.text(bar.get_x() + bar.get_width() / 2, y + offset,
-                f"{mean:.0f}", ha="center", va=va, fontsize=9)
-
-    ax.set_ylabel("Mean Episode Reward", fontsize=11)
-    ax.set_title(f"Reward Comparison ({len(stats[labels[0]]['rewards'])} seeds)",
-                 fontsize=11)
-    ax.tick_params(axis="x", labelrotation=15)
-    ax.grid(True, alpha=0.3, axis="y")
-
-    plt.tight_layout()
-    out = os.path.join(save_dir, "comparison.png")
-    plt.savefig(out, dpi=150)
-    plt.close()
-    print(f"  [Plot] {out}")
+    print(f"\n  Rollouts + manifest.json written to {save_dir}")
+    return save_dir
 
 
 # ---------------------------------------------------------------------------
@@ -548,42 +505,45 @@ def _plot_comparison(trajectories: dict, stats: dict, cfg: dict,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Load and compare trained RL models on a PC-Gym scenario."
+        description="Run models on a PC-Gym scenario and serialise per-step rollouts."
     )
     parser.add_argument(
-        "--scenario", type=str, default="cstr",
-        choices=list(SCENARIOS.keys()),
-        help="PC-Gym scenario to evaluate on",
+        "--scenario", type=str, default="cstr", choices=list(SCENARIOS.keys()),
+        help="PC-Gym scenario to run on",
     )
     parser.add_argument(
-        "--models", type=str, nargs="*", default=[],
-        metavar="PATH",
-        help="Checkpoint paths to evaluate (default: auto-discover under "
+        "--models", type=str, nargs="*", default=[], metavar="PATH",
+        help="Checkpoint paths to run (default: auto-discover under "
              "outputs/models/<scenario>/)",
     )
     parser.add_argument(
         "--n-seeds", type=int, default=10,
-        help="Number of seeds for reward statistics (default: 10)",
+        help="Number of seeds (episodes) recorded per method (default: 10)",
     )
     parser.add_argument(
-        "--eval-seed", type=int, default=42,
-        help="Seed used for the trajectory plot (default: 42)",
+        "--no-oracle", action="store_true",
+        help="Skip the NMPC oracle (faster; included by default)",
+    )
+    parser.add_argument(
+        "--mpc-horizon", type=int, default=20,
+        help="NMPC oracle prediction horizon in steps (default: 20)",
     )
     parser.add_argument(
         "--models-dir", type=str, default="outputs/models",
         help="Root directory where model checkpoints are stored",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="outputs/runs",
-        help="Root directory for run outputs (default: outputs/runs/)",
+        "--output-dir", type=str, default="outputs/rollouts",
+        help="Root directory for rollout outputs (default: outputs/rollouts/)",
     )
     args = parser.parse_args()
 
-    run_comparison(
+    run_rollouts(
         scenario=args.scenario,
         model_paths=args.models,
         n_seeds=args.n_seeds,
-        eval_seed=args.eval_seed,
+        use_oracle=not args.no_oracle,
+        mpc_horizon=args.mpc_horizon,
         models_dir=args.models_dir,
         output_dir=args.output_dir,
     )

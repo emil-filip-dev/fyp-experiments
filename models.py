@@ -1,22 +1,32 @@
 """
 models.py
 =========
-All RL model definitions for this project.
+All RL model definitions for this project. Every agent shares one custom core
+(Actor / Critic / replay buffer); the variants differ only in how decide_action
+behaves, which makes them a clean ablation set:
 
-Standard models  (Stable Baselines 3 — used by train.py)
----------------------------------------------------------
-  ddpg  — Deep Deterministic Policy Gradient
-  td3   — Twin Delayed DDPG
-  ppo   — Proximal Policy Optimization
-
-Shadow models  (custom implementations — used by train_shadow.py)
------------------------------------------------------------------
+Shadow models  (used by train_shadow.py)
+----------------------------------------
   ddpg  — ShadowDDPG  (single critic, Q-value or agent-decision switching)
   td3   — ShadowTD3   (twin critics, delayed updates, target policy smoothing)
 
-PPO is not supported for shadow mode: it is an on-policy stochastic algorithm
-and the Q-value / action-decision switching criteria require a deterministic
-off-policy actor-critic.
+Standard / no-shadow models  (used by train.py)
+-----------------------------------------------
+  ddpg  — PureDDPG    (ShadowDDPG with switching disabled — agent always acts)
+  td3   — PureTD3     (ShadowTD3  with switching disabled)
+
+These are the fair "standard DDPG/TD3" baselines for shadow mode: identical
+core, hyperparameters, and PID-assisted exploration, differing ONLY in the
+switching decision. (PPO is not supported — shadow switching needs a
+deterministic off-policy actor-critic.)
+
+Stable-Baselines3 backend  (labelled "SB3 DDPG" / "Shadow SB3 DDPG")
+-------------------------------------------------------------------
+An alternative, separately-tuned off-the-shelf implementation kept alongside the
+custom core (create_sb3_agent / create_shadow_sb3_agent). Shadow mode is added to
+SB3 by overriding _sample_action so the *executed* (Q-value-switched) action is
+what gets stored in the replay buffer. Lets us test whether shadow switching
+helps a strong, well-tuned learner. Only q-value switching is supported on SB3.
 
 Device helpers
 --------------
@@ -32,7 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from stable_baselines3 import DDPG as SB3DDPG
-from stable_baselines3 import PPO, TD3
+from stable_baselines3 import TD3 as SB3TD3
 from stable_baselines3.common.noise import NormalActionNoise
 
 
@@ -61,8 +71,9 @@ def device_label(device: torch.device) -> str:
 # Available model names
 # ---------------------------------------------------------------------------
 
-STANDARD_MODELS = ["ddpg", "td3", "ppo"]
-SHADOW_MODELS   = ["ddpg", "td3"]
+SHADOW_MODELS = ["ddpg", "td3"]
+PURE_MODELS   = ["ddpg", "td3"]   # standard (no-shadow) custom agents
+SB3_MODELS    = ["ddpg", "td3"]   # Stable-Baselines3 backend (normal + shadow)
 
 
 # ---------------------------------------------------------------------------
@@ -528,35 +539,54 @@ class ShadowTD3:
 
 
 # ---------------------------------------------------------------------------
-# Standard (SB3) agent factory  — used by train.py
+# Pure (no-shadow) custom agents — the fair ablation baseline
 # ---------------------------------------------------------------------------
+# These share the ShadowDDPG / ShadowTD3 core exactly but disable shadow-mode
+# switching: the agent's own action is always executed. They are the correct
+# "standard DDPG/TD3" baseline for measuring the *effect of shadow switching*,
+# since the learner is held identical (unlike the SB3 agents in train.py, which
+# are a different, separately-tuned implementation).
 
-def create_standard_agent(model_type: str, env, seed: int = 42,
-                           device: torch.device | None = None):
-    """
-    Return an untrained SB3 model ready for .learn().
+class PureDDPG(ShadowDDPG):
+    """Standard DDPG: always executes the agent's action, no shadow switching."""
 
-    Default hyperparameters are reasonable starting points for PC-Gym
-    environments; tune via the model's constructor if needed.
-    """
-    dev_str = str(device) if device is not None else "auto"
-    common  = dict(policy="MlpPolicy", env=env, seed=seed, verbose=0,
+    def decide_action(self, obs, baseline_action, training: bool = True):
+        noise = (
+            np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
+            if training else np.zeros(self.action_dim, dtype=np.float32)
+        )
+        action_agent, _ = self._get_agent_action(obs)
+        action_noisy    = np.clip(action_agent + noise, -1.0, 1.0)
+        self.agent_takeover_count += 1
+        return action_noisy, True, action_noisy
+
+
+class PureTD3(ShadowTD3):
+    """Standard TD3: always executes the agent's action, no shadow switching."""
+
+    def decide_action(self, obs, baseline_action, training: bool = True):
+        noise = (
+            np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
+            if training else np.zeros(self.action_dim, dtype=np.float32)
+        )
+        action_agent, _ = self._get_agent_action(obs)
+        action_noisy    = np.clip(action_agent + noise, -1.0, 1.0)
+        self.agent_takeover_count += 1
+        return action_noisy, True, action_noisy
+
+
+def create_pure_agent(
+    model_type:  str,
+    state_dim:   int,
+    action_dim:  int,
+    device:      torch.device | None = None,
+):
+    """Return an untrained no-shadow custom agent (PureDDPG or PureTD3) — the
+    ablation baseline that shares the shadow agents' core."""
+    dev_str = str(device) if device is not None else "cpu"
+    kwargs  = dict(state_dim=state_dim, action_dim=action_dim, mode="qvalue",
                    device=dev_str)
-
-    if model_type == "ppo":
-        return PPO(learning_rate=3e-4, n_steps=2048, batch_size=64,
-                   n_epochs=10, gamma=0.99, **common)
-
-    n_actions    = env.action_space.shape[0]
-    action_noise = NormalActionNoise(mean=np.zeros(n_actions),
-                                     sigma=0.1 * np.ones(n_actions))
-
-    if model_type == "td3":
-        return TD3(learning_rate=1e-3, batch_size=256, gamma=0.99,
-                   tau=0.005, action_noise=action_noise, **common)
-
-    return SB3DDPG(learning_rate=1e-3, batch_size=256, gamma=0.99,
-                   tau=0.005, action_noise=action_noise, **common)
+    return PureTD3(**kwargs) if model_type == "td3" else PureDDPG(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -577,3 +607,103 @@ def create_shadow_agent(
     kwargs  = dict(state_dim=state_dim, action_dim=action_dim, mode=mode,
                    lambda_reg=lambda_reg, eta_agent=eta_agent, device=dev_str)
     return ShadowTD3(**kwargs) if model_type == "td3" else ShadowDDPG(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Stable-Baselines3 backend  — "SB3 DDPG" / "Shadow SB3 DDPG"
+# ---------------------------------------------------------------------------
+# A separately-tuned off-the-shelf learner kept alongside the custom core. Shadow
+# mode is added by overriding _sample_action so the *executed* (switched) action
+# is stored in the replay buffer, exactly like the custom ShadowDDPG.
+#
+# Assumes a normalised action space ([-1, 1]) — all project scenarios use
+# normalise_a=True, so SB3's scaled action space equals the env action space and
+# the PID baselines (which output in [-1, 1]) drop in without rescaling.
+
+def _sb3_kwargs(env, seed, device):
+    dev_str   = str(device) if device is not None else "auto"
+    n_actions = env.action_space.shape[0]
+    noise     = NormalActionNoise(mean=np.zeros(n_actions),
+                                  sigma=0.1 * np.ones(n_actions))
+    return dict(policy="MlpPolicy", env=env, seed=seed, verbose=0, device=dev_str,
+                learning_rate=1e-3, batch_size=256, gamma=0.99, tau=0.005,
+                action_noise=noise)
+
+
+class _ShadowSB3Mixin:
+    """
+    Adds shadow-mode Q-value switching to an SB3 off-policy actor-critic.
+
+    During data collection the executed action is the baseline's unless the
+    critic prefers the agent's (Q(s, a_agent) > Q(s, a_baseline)). The executed
+    action is what is stored in the replay buffer, so the critic learns the value
+    of the deployed mixed policy. Switching activates only after the warmup
+    (learning_starts), when the critic is usable.
+    """
+
+    baseline = None
+
+    def set_baseline(self, baseline):
+        self.baseline     = baseline
+        self._n_decisions = 0      # number of switching decisions (for takeover %)
+        self._n_agent     = 0      # how many chose the agent's action
+        return self
+
+    def reset_baseline(self):
+        if self.baseline is not None:
+            self.baseline.reset()
+
+    def _q1(self, obs_2d, act_2d):
+        """min-batch Q1(obs, action) as a 1-D numpy array; actions are scaled [-1,1]."""
+        obs_t = self.policy.obs_to_tensor(np.asarray(obs_2d, dtype=np.float32))[0]
+        act_t = torch.as_tensor(np.asarray(act_2d, dtype=np.float32), device=self.device)
+        with torch.no_grad():
+            return self.critic.q1_forward(obs_t, act_t).cpu().numpy().reshape(-1)
+
+    def _switch(self, obs_2d, agent_scaled_2d):
+        """Return (executed_scaled_2d, used_agent_bool_array) for a batch of obs."""
+        n      = agent_scaled_2d.shape[0]
+        a_base = np.array([np.asarray(self.baseline.predict(obs_2d[i])[0], dtype=np.float32)
+                           for i in range(n)])
+        use_agent = self._q1(obs_2d, agent_scaled_2d) > self._q1(obs_2d, a_base)
+        executed  = np.where(use_agent[:, None], agent_scaled_2d, a_base).astype(np.float32)
+        return executed, use_agent
+
+    def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
+        action, buffer_action = super()._sample_action(learning_starts, action_noise, n_envs)
+        if self.baseline is None or self.num_timesteps < learning_starts:
+            return action, buffer_action
+        executed, use_agent = self._switch(self._last_obs, buffer_action)
+        self._n_decisions += int(use_agent.size)
+        self._n_agent     += int(use_agent.sum())
+        return self.policy.unscale_action(executed), executed
+
+    def executed_action(self, obs, baseline):
+        """Deterministic switched action for a single obs (used at evaluation)."""
+        a_agent, _ = self.predict(obs, deterministic=True)
+        a_base     = np.asarray(baseline.predict(obs)[0], dtype=np.float32)
+        q_agent    = self._q1(obs[None], a_agent[None])[0]
+        q_base     = self._q1(obs[None], a_base[None])[0]
+        return a_agent if q_agent > q_base else a_base
+
+
+class ShadowSB3DDPG(_ShadowSB3Mixin, SB3DDPG):
+    """SB3 DDPG with shadow-mode Q-value switching."""
+
+
+class ShadowSB3TD3(_ShadowSB3Mixin, SB3TD3):
+    """SB3 TD3 with shadow-mode Q-value switching."""
+
+
+def create_sb3_agent(model_type: str, env, seed: int = 42,
+                     device: torch.device | None = None):
+    """Return an untrained plain SB3 agent (DDPG or TD3) — the 'SB3 DDPG' baseline."""
+    cls = SB3TD3 if model_type == "td3" else SB3DDPG
+    return cls(**_sb3_kwargs(env, seed, device))
+
+
+def create_shadow_sb3_agent(model_type: str, env, baseline, seed: int = 42,
+                           device: torch.device | None = None):
+    """Return an untrained shadow-mode SB3 agent with the PID baseline attached."""
+    cls = ShadowSB3TD3 if model_type == "td3" else ShadowSB3DDPG
+    return cls(**_sb3_kwargs(env, seed, device)).set_baseline(baseline)

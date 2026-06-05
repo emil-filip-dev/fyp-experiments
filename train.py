@@ -1,110 +1,69 @@
 """
 train.py
 ========
-Train a standard (non-shadow) RL agent on a PC-Gym process-control environment.
+Train an RL agent on a PC-Gym process-control environment — standard or
+shadow-mode, custom core or Stable-Baselines3, all from one entry point.
 
-Uses Stable Baselines 3.  The agent always acts — no baseline switching.
-For shadow-mode training see train_shadow.py.
+Mode (--shadow):
+  standard (default) — the agent always executes its own action.
+  shadow             — at each step the agent's action is compared against a PID
+                       baseline and a switching criterion decides which to apply.
+  Standard and shadow share the SAME core/hyperparameters, so they form a clean
+  ablation isolating the effect of shadow switching.
+
+Backend (--backend):
+  custom (default) — the project's DDPG/TD3 core. Labelled "DDPG"/"TD3"
+                     (standard) or "Shadow DDPG"/"Shadow TD3" (shadow).
+  sb3              — Stable-Baselines3 DDPG/TD3. Labelled "SB3 DDPG" /
+                     "Shadow SB3 DDPG". SB3 shadow supports --mode qvalue only.
+
+Shadow switching modes (--mode, custom backend supports both):
+  qvalue  — execute agent action if Q(s, a_agent) > Q(s, a_baseline)
+  agent   — agent outputs a control-authority probability; act if > --eta-agent
+            (optional L1 regularisation toward the baseline via --lambda-reg)
 
 Supported scenarios: cstr, four_tank, multistage_extraction, crystallization
-Supported models:    ddpg, td3, ppo
+Supported models:    ddpg, td3   (PPO unsupported — shadow needs a deterministic
+                                   off-policy actor-critic)
 
-Outputs
--------
-  outputs/models/<scenario>/<model>/   — best_model.zip + training_curves.png
+Outputs  (outputs/models/<scenario>/<run_label>/ — best.pt custom, best_model.zip sb3)
+  standard custom : <model>/                    e.g. ddpg/
+  shadow   custom : shadow_<model>_<mode>/       (+ _reg<λ> for agent mode w/ reg)
+  standard sb3    : sb3_<model>/
+  shadow   sb3    : shadow_sb3_<model>/
 
 Usage
 -----
-  .venv/Scripts/python train.py --scenario cstr --model td3
-  .venv/Scripts/python train.py --scenario four_tank --model ppo --steps 300000
-  .venv/Scripts/python train.py --scenario cstr --model td3 --cpu
+  .venv/Scripts/python train.py --scenario cstr --model ddpg                       # DDPG
+  .venv/Scripts/python train.py --scenario cstr --model ddpg --shadow              # Shadow DDPG
+  .venv/Scripts/python train.py --scenario cstr --model ddpg --backend sb3         # SB3 DDPG
+  .venv/Scripts/python train.py --scenario cstr --model ddpg --shadow --backend sb3  # Shadow SB3 DDPG
+  .venv/Scripts/python train.py --scenario cstr --model td3 --shadow --mode agent --lambda-reg 2.0
 """
 
 import argparse
-import os
 
 import numpy as np
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.monitor import Monitor
-from tqdm import tqdm
+import torch
 
-from models import STANDARD_MODELS, create_standard_agent, device_label, resolve_device
+from models import (
+    PURE_MODELS,
+    create_pure_agent,
+    create_shadow_agent,
+    device_label,
+    resolve_device,
+)
 from scenarios import SCENARIOS, make_env_for
-from evaluate import plot_training_curves
+from trainer import configure_utf8_output, train_custom
 
 
-# ---------------------------------------------------------------------------
-# Combined training callback
-# ---------------------------------------------------------------------------
-
-class _TrainingCallback(BaseCallback):
-    """
-    Single callback that handles everything during model.learn():
-      - tqdm progress bar (one bar, total timesteps)
-      - per-episode reward logging (via Monitor's info dict)
-      - periodic evaluation every eval_freq steps
-      - best-model saving on improved eval reward
-    """
-
-    def __init__(self, total_steps: int, eval_env, save_path: str,
-                 eval_freq: int = 10_000, n_eval: int = 5):
-        super().__init__(verbose=0)
-        self._eval_env  = eval_env
-        self._save_path = save_path
-        self._eval_freq = eval_freq
-        self._n_eval    = n_eval
-        self._next_eval = eval_freq
-
-        self.rewards_log: list[tuple[int, float]] = []
-        self.eval_log:    list[tuple[int, float]] = []
-
-        self._bar       = tqdm(total=total_steps, unit="step",
-                               dynamic_ncols=True, desc="Training")
-        self._last_ep_r = float("nan")
-        self._best_eval = -float("inf")
-
-    def _on_step(self) -> bool:
-        self._bar.update(1)
-
-        # Collect episode reward when Monitor signals episode end
-        for info in self.locals.get("infos", []):
-            if "episode" in info:
-                self._last_ep_r = float(info["episode"]["r"])
-                self.rewards_log.append((self.num_timesteps, self._last_ep_r))
-
-        # Periodic evaluation — while loop so no window is skipped
-        while self.num_timesteps >= self._next_eval:
-            self._next_eval += self._eval_freq
-            rewards = []
-            for s in range(self._n_eval):
-                obs, _ = self._eval_env.reset(seed=s)
-                total, done = 0.0, False
-                while not done:
-                    action, _ = self.model.predict(obs, deterministic=True)
-                    obs, r, terminated, truncated, _ = self._eval_env.step(action)
-                    done   = terminated or truncated
-                    total += r
-                rewards.append(total)
-            mean_r = float(np.mean(rewards))
-            self.eval_log.append((self.num_timesteps, mean_r))
-            if mean_r > self._best_eval:
-                self._best_eval = mean_r
-                self.model.save(os.path.join(self._save_path, "best_model"))
-                tqdm.write(f"  [Save] step {self.num_timesteps:,} — new best eval: {mean_r:.1f}")
-
-        # Update postfix with latest metrics
-        postfix: dict[str, str] = {}
-        if not np.isnan(self._last_ep_r):
-            postfix["ep_r"] = f"{self._last_ep_r:.0f}"
-        if self.eval_log:
-            postfix["eval"] = f"{self.eval_log[-1][1]:.0f}"
-        if self._best_eval > -float("inf"):
-            postfix["best"] = f"{self._best_eval:.0f}"
-        self._bar.set_postfix(postfix)
-        return True
-
-    def on_training_end(self) -> None:
-        self._bar.close()
+def _print_header(scenario, model_desc, device, total_steps, seed):
+    print(f"\n{'='*60}")
+    print(f"  Scenario : {scenario}")
+    print(f"  Model    : {model_desc}")
+    print(f"  Device   : {device_label(device)}")
+    print(f"  Steps    : {total_steps:,}  |  seed={seed}")
+    print(f"{'='*60}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -112,37 +71,85 @@ class _TrainingCallback(BaseCallback):
 # ---------------------------------------------------------------------------
 
 def train(
-    scenario:    str  = "cstr",
-    model_type:  str  = "td3",
-    total_steps: int  = 200_000,
-    seed:        int  = 42,
-    force_cpu:   bool = False,
-    output_dir:  str  = "outputs/models",
+    scenario:    str   = "cstr",
+    model_type:  str   = "ddpg",
+    shadow:      bool  = False,
+    mode:        str   = "qvalue",
+    backend:     str   = "custom",
+    total_steps: int   = 200_000,
+    seed:        int   = 42,
+    lambda_reg:  float = 0.0,
+    eta_agent:   float = 0.5,
+    eval_freq:   int   = 1_000,
+    force_cpu:   bool  = False,
+    output_dir:  str   = "outputs/models",
 ):
-    cfg       = SCENARIOS[scenario]
-    save_path = os.path.join(output_dir, scenario, model_type)
-    os.makedirs(save_path, exist_ok=True)
+    cfg = SCENARIOS[scenario]
 
-    device    = resolve_device(force_cpu)
-    train_env = Monitor(make_env_for(scenario))
-    eval_env  = make_env_for(scenario)
-    model     = create_standard_agent(model_type, train_env, seed=seed, device=device)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    print(f"\n{'='*60}")
-    print(f"  Scenario : {scenario}")
-    print(f"  Model    : {model_type.upper()}")
-    print(f"  Device   : {device_label(device)}")
-    print(f"  Steps    : {total_steps:,}  |  seed={seed}")
-    print(f"  Output   : {save_path}")
-    print(f"{'='*60}\n")
+    device = resolve_device(force_cpu)
 
-    cb = _TrainingCallback(total_steps, eval_env, save_path,
-                           eval_freq=10_000, n_eval=5)
-    model.learn(total_timesteps=total_steps, callback=cb)
+    # -- SB3 backend ---------------------------------------------------------
+    if backend == "sb3":
+        from stable_baselines3.common.monitor import Monitor
+        from trainer import train_sb3
 
-    tqdm.write(f"\n  Training complete.  Best eval reward: {cb._best_eval:.1f}")
-    plot_training_curves(cb.rewards_log, cb.eval_log, save_path, scenario, model_type)
-    return model
+        env = Monitor(make_env_for(scenario))
+
+        if shadow:
+            if mode != "qvalue":
+                raise ValueError("SB3 shadow backend supports only --mode qvalue "
+                                 "(agent-decision mode needs a custom policy head).")
+            from models import create_shadow_sb3_agent
+            model      = create_shadow_sb3_agent(model_type, env, cfg["baseline_cls"](),
+                                                 seed=seed, device=device)
+            run_label  = f"shadow_sb3_{model_type}"
+            model_desc = f"Shadow SB3 {model_type.upper()}  (mode=qvalue)"
+            meta_extra = {"mode": "qvalue", "backend": "sb3"}
+        else:
+            from models import create_sb3_agent
+            model      = create_sb3_agent(model_type, env, seed=seed, device=device)
+            run_label  = f"sb3_{model_type}"
+            model_desc = f"SB3 {model_type.upper()} (standard, no shadow)"
+            meta_extra = {"backend": "sb3"}
+
+        _print_header(scenario, model_desc, device, total_steps, seed)
+        return train_sb3(
+            model, scenario=scenario, model_type=model_type, run_label=run_label,
+            total_steps=total_steps, seed=seed, output_dir=output_dir,
+            is_shadow=shadow, eval_freq=eval_freq, meta_extra=meta_extra,
+        )
+
+    # -- Custom core ---------------------------------------------------------
+    if shadow:
+        agent = create_shadow_agent(
+            model_type=model_type, state_dim=cfg["state_dim"],
+            action_dim=cfg["action_dim"], mode=mode, lambda_reg=lambda_reg,
+            eta_agent=eta_agent, device=device,
+        )
+        if mode == "agent" and lambda_reg > 0.0:
+            run_label = f"shadow_{model_type}_agent_reg{lambda_reg}"
+        else:
+            run_label = f"shadow_{model_type}_{mode}"
+        model_desc = f"Shadow {model_type.upper()}  (mode={mode}, lambda={lambda_reg}, eta={eta_agent})"
+        meta_extra = {"mode": mode, "lambda_reg": lambda_reg, "eta_agent": eta_agent}
+    else:
+        agent = create_pure_agent(
+            model_type=model_type, state_dim=cfg["state_dim"],
+            action_dim=cfg["action_dim"], device=device,
+        )
+        run_label  = model_type            # "ddpg" / "td3" -> labelled DDPG / TD3
+        model_desc = f"{model_type.upper()} (standard, no shadow)"
+        meta_extra = None
+
+    _print_header(scenario, model_desc, device, total_steps, seed)
+    return train_custom(
+        agent, scenario=scenario, model_type=model_type, run_label=run_label,
+        total_steps=total_steps, seed=seed, output_dir=output_dir,
+        is_shadow=shadow, eval_freq=eval_freq, meta_extra=meta_extra,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +157,9 @@ def train(
 # ---------------------------------------------------------------------------
 
 def main():
+    configure_utf8_output()
     parser = argparse.ArgumentParser(
-        description="Train a standard RL agent on a PC-Gym environment."
+        description="Train a standard or shadow-mode RL agent on a PC-Gym environment."
     )
     parser.add_argument(
         "--scenario", type=str, default="cstr",
@@ -159,9 +167,22 @@ def main():
         help="PC-Gym environment to train on",
     )
     parser.add_argument(
-        "--model", type=str, default="td3",
-        choices=STANDARD_MODELS,
-        help=f"RL algorithm: {', '.join(STANDARD_MODELS)}  (default: td3)",
+        "--model", type=str, default="ddpg",
+        choices=PURE_MODELS,
+        help=f"RL algorithm: {', '.join(PURE_MODELS)}  (default: ddpg)",
+    )
+    parser.add_argument(
+        "--shadow", action="store_true",
+        help="Train in shadow mode (agent action gated against the PID baseline). "
+             "Default: standard (agent always acts).",
+    )
+    parser.add_argument(
+        "--mode", type=str, default="qvalue", choices=["qvalue", "agent"],
+        help="Shadow switching mechanism: qvalue (recommended) or agent (--shadow only)",
+    )
+    parser.add_argument(
+        "--backend", type=str, default="custom", choices=["custom", "sb3"],
+        help="custom = project's DDPG/TD3 core; sb3 = Stable-Baselines3. Default: custom",
     )
     parser.add_argument(
         "--steps", type=int, default=200_000,
@@ -172,8 +193,22 @@ def main():
         help="Global random seed",
     )
     parser.add_argument(
+        "--lambda-reg", type=float, default=0.0,
+        help="Regularisation strength (lambda) — penalises distance from baseline "
+             "(shadow agent mode only)",
+    )
+    parser.add_argument(
+        "--eta-agent", type=float, default=0.5,
+        help="Control authority threshold (eta) — agent acts when decision prob > eta "
+             "(shadow agent mode only)",
+    )
+    parser.add_argument(
+        "--eval-freq", type=int, default=1_000,
+        help="Evaluate every N env steps (default: 1000)",
+    )
+    parser.add_argument(
         "--output-dir", type=str, default="outputs/models",
-        help="Root directory for checkpoints and plots (default: outputs/models/)",
+        help="Root directory for checkpoints (default: outputs/models/)",
     )
     parser.add_argument(
         "--cpu", action="store_true",
@@ -184,8 +219,14 @@ def main():
     train(
         scenario=args.scenario,
         model_type=args.model,
+        shadow=args.shadow,
+        mode=args.mode,
+        backend=args.backend,
         total_steps=args.steps,
         seed=args.seed,
+        lambda_reg=args.lambda_reg,
+        eta_agent=args.eta_agent,
+        eval_freq=args.eval_freq,
         force_cpu=args.cpu,
         output_dir=args.output_dir,
     )
