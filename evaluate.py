@@ -32,235 +32,17 @@ Output: outputs/rollouts/<scenario>/<timestamp>/  (<method>.npz + manifest.json)
 """
 
 import argparse
-import copy
-import glob
-import io
 import json
 import os
-from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from stable_baselines3 import DDPG as SB3DDPG
-from stable_baselines3 import TD3 as SB3TD3
+import torch
 
-from models import (
-    PureDDPG,
-    PureTD3,
-    ShadowDDPG,
-    ShadowSB3DDPG,
-    ShadowSB3TD3,
-    ShadowTD3,
-)
+from models import NMPCController, ShadowModels, get_shadow_model, get_standard_model
 from scenarios import SCENARIOS, make_env_for
-
-
-# ---------------------------------------------------------------------------
-# SB3 adapters — make a loaded SB3 model usable by the rollout recorder
-# ---------------------------------------------------------------------------
-
-class _SB3Adapter:
-    """Plain SB3 model wrapper — always applies its own action (no switching)."""
-
-    def __init__(self, model):
-        self._model           = model
-        self.total_steps      = 0
-        self.warmup_steps     = 0
-        self.max_t_train_frac = 0.0
-        self.action_dim       = model.action_space.shape[0]
-
-    def decide_action(self, obs, baseline_action, training=False):
-        action, _ = self._model.predict(obs, deterministic=True)
-        return action, True, action
-
-    def store(self, *args):  pass
-    def update(self):        pass
-    def reset(self):         pass
-
-
-class _ShadowSB3Adapter(_SB3Adapter):
-    """Shadow SB3 model wrapper — q-value switching vs the passed baseline action."""
-
-    def decide_action(self, obs, baseline_action, training=False):
-        a_agent, _ = self._model.predict(obs, deterministic=True)
-        obs_2d     = np.asarray(obs, dtype=np.float32)[None]
-        q_agent    = self._model._q1(obs_2d, np.asarray(a_agent)[None])[0]
-        q_baseline = self._model._q1(obs_2d, np.asarray(baseline_action)[None])[0]
-        if q_agent > q_baseline:
-            return a_agent, True, a_agent
-        return baseline_action, False, a_agent
-
-
-# ---------------------------------------------------------------------------
-# NMPC oracle — receding-horizon do-mpc controller (best-achievable reference)
-# ---------------------------------------------------------------------------
-
-class NMPCController:
-    """
-    Nonlinear MPC oracle for a PC-Gym scenario.
-
-    Built on PC-Gym's own do-mpc `oracle` (CasADi + IPOPT) so the prediction
-    model is *exactly* the environment's dynamics — the "best achievable"
-    reference. Exposes .predict(obs) / .reset() like the PID baselines and runs
-    in true receding-horizon fashion against the real (noisy) environment.
-    """
-
-    def __init__(self, cfg: dict, horizon: int = 20):
-        # Imported lazily so --no-oracle runs never pay the do-mpc import cost.
-        from pcgym import make_env
-        from pcgym.oracle import oracle
-
-        # oracle mutates env_params in place, so hand it a private copy.
-        env_params = copy.deepcopy(cfg["env_params"])
-        self._oracle = oracle(make_env, env_params, MPC_params={"N": horizon})
-
-        self._nx          = self._oracle.env.Nx_oracle
-        self._a_low       = np.asarray(env_params["a_space"]["low"],  dtype=np.float64)
-        self._a_high      = np.asarray(env_params["a_space"]["high"], dtype=np.float64)
-        self._o_low       = np.asarray(env_params["o_space"]["low"],  dtype=np.float64)
-        self._o_high      = np.asarray(env_params["o_space"]["high"], dtype=np.float64)
-        self._normalise_o = env_params.get("normalise_o", True)
-        self._x0          = np.asarray(cfg["env_params"]["x0"][:self._nx], dtype=np.float64)
-
-        # Build the NLP once; reset() re-initialises it cheaply each episode.
-        with redirect_stdout(io.StringIO()):
-            self._mpc, _ = self._oracle.setup_mpc()
-
-        # PC-Gym's shipped p_fun does `int(t_now/dt - 1)`, which crashes on modern
-        # numpy (do-mpc passes t_now as a 1-D array) and lags the setpoint by one
-        # step. make_step looks up self.p_fun dynamically, so we override it with a
-        # scalar-safe version that tracks the *current* setpoint. Only setpoint
-        # scheduling is supported (no disturbances / delta-u).
-        if self._oracle.has_disturbances or self._oracle.use_delta_u:
-            raise NotImplementedError(
-                "NMPCController supports setpoint-tracking scenarios only "
-                "(no disturbances or delta-u)."
-            )
-        self._mpc.p_fun = self._make_p_fun()
-        self.reset()
-
-    def _make_p_fun(self):
-        """Build a scalar-safe do-mpc parameter function for setpoint tracking."""
-        sp_dict        = self._oracle.env_params["SP"]
-        sp_arrays      = [np.asarray(v, dtype=float) for v in sp_dict.values()]
-        dt             = self._oracle.env.dt
-        get_p_template = self._mpc.get_p_template
-
-        def p_fun(t_now):
-            t = float(np.asarray(t_now).flatten()[0])
-            k = int(round(t / dt))                       # current step index
-            p_template = get_p_template(1)
-            sp_vals = [arr[min(k, len(arr) - 1)] for arr in sp_arrays]
-            p_template["_p", 0, "SP"] = np.array(sp_vals).reshape(-1, 1)
-            return p_template
-
-        return p_fun
-
-    def reset(self):
-        """Restart for a new episode: reset the MPC clock and initial guess."""
-        self._mpc.reset_history()            # resets internal t0 -> 0 (SP indexing)
-        self._mpc.x0 = self._x0
-        with redirect_stdout(io.StringIO()):
-            self._mpc.set_initial_guess()
-
-    def predict(self, obs, deterministic: bool = True):
-        obs = np.asarray(obs, dtype=np.float64)
-        if self._normalise_o:
-            phys = (obs + 1.0) / 2.0 * (self._o_high - self._o_low) + self._o_low
-        else:
-            phys = obs
-        x0 = phys[:self._nx].reshape(-1, 1)        # physical model state (no setpoints)
-
-        with redirect_stdout(io.StringIO()):
-            u = np.asarray(self._mpc.make_step(x0)).flatten()   # physical input(s)
-
-        # Re-normalise to the env's [-1, 1] action space.
-        u_norm = 2.0 * (u - self._a_low) / (self._a_high - self._a_low) - 1.0
-        return np.clip(u_norm, -1.0, 1.0).astype(np.float32), None
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def _label_from_path(checkpoint_path: str) -> str:
-    """Human-readable label inferred from the checkpoint's parent directory."""
-    name = Path(checkpoint_path).parent.name
-
-    # Exact matches for the standard (no-shadow) custom agents
-    exact = {"ddpg": "DDPG", "td3": "TD3"}
-    if name in exact:
-        return exact[name]
-
-    # SB3 backend (check before the generic shadow_ branch — shadow_sb3_* also
-    # starts with "shadow_").
-    if name.startswith("shadow_sb3_"):
-        return f"Shadow SB3 {'TD3' if 'td3' in name else 'DDPG'}"
-    if name.startswith("sb3_"):
-        return f"SB3 {'TD3' if 'td3' in name else 'DDPG'}"
-
-    # Shadow model names: shadow_<model>_<mode>[_reg<lambda>]
-    if name.startswith("shadow_"):
-        parts = name[len("shadow_"):]          # e.g. "td3_qvalue" or "ddpg_agent_reg2.0"
-        model = parts.split("_")[0].upper()    # DDPG or TD3
-        if "agent_reg" in parts:
-            lam = parts.split("agent_reg")[-1]
-            return f"Shadow {model} (Agent, lambda={lam})"
-        if "agent" in parts:
-            return f"Shadow {model} (Agent)"
-        return f"Shadow {model} (Q-value)"
-
-    # Pure (no-shadow) custom ablation: pure_<model>
-    if name.startswith("pure_"):
-        model = "TD3" if "td3" in name else "DDPG"
-        return f"{model} (no shadow)"
-
-    return name
-
-
-def load_model(checkpoint_path: str, state_dim: int, action_dim: int):
-    """
-    Load a trained model from a checkpoint, inferred from its parent dir name:
-      *.pt   — custom Shadow{DDPG,TD3} / Pure{DDPG,TD3}
-      *.zip  — SB3 backend: plain SB3 DDPG/TD3, or Shadow SB3 DDPG/TD3
-    """
-    name   = Path(checkpoint_path).parent.name.lower()
-    ext    = Path(checkpoint_path).suffix.lower()
-    is_td3 = "td3" in name
-
-    if ext == ".zip":        # SB3 backend
-        if "shadow" in name:
-            cls = ShadowSB3TD3 if is_td3 else ShadowSB3DDPG
-            return _ShadowSB3Adapter(cls.load(checkpoint_path))
-        cls = SB3TD3 if is_td3 else SB3DDPG
-        return _SB3Adapter(cls.load(checkpoint_path))
-
-    # .pt — custom core. Check "shadow" before "td3" so a no-shadow td3 maps to
-    # PureTD3, not ShadowTD3.
-    mode = "agent" if "agent" in name else "qvalue"
-
-    if "shadow" not in name:        # pure / no-shadow custom ablation
-        cls   = PureTD3 if is_td3 else PureDDPG
-        agent = cls(state_dim=state_dim, action_dim=action_dim, mode="qvalue")
-    elif is_td3:
-        agent = ShadowTD3(state_dim=state_dim, action_dim=action_dim, mode=mode)
-    else:
-        agent = ShadowDDPG(state_dim=state_dim, action_dim=action_dim, mode=mode)
-
-    agent.load(checkpoint_path)
-    return agent
-
-
-def discover_models(scenario: str, models_dir: str = "outputs/models") -> list[str]:
-    """
-    Return all checkpoint paths under models_dir/<scenario>/*/ — best.pt (custom
-    core) and best_model.zip (SB3 backend).
-    """
-    paths = []
-    for pattern in ("best.pt", "best_model.zip"):
-        paths.extend(glob.glob(os.path.join(models_dir, scenario, "*", pattern)))
-    return sorted(paths)
+from util import resolve_device
 
 
 # ---------------------------------------------------------------------------
@@ -295,12 +77,10 @@ def run_episode(env, agent, baseline, training: bool,
     while not done:
         a_baseline, _ = baseline.predict(obs)
 
-        if step < t_warmup or (training and agent.total_steps < agent.warmup_steps):
-            a_exec, a_agent, used_agent = a_baseline, a_baseline.copy(), False
-        else:
-            a_exec, used_agent, a_agent = agent.decide_action(
-                obs, a_baseline, training=training
-            )
+        force_baseline = step < t_warmup or (training and agent.total_steps < agent.warmup_steps)
+        a_exec, used_agent, a_agent = agent.decide_action(
+            obs, a_baseline, training=training, force_baseline=force_baseline
+        )
 
         next_obs, reward, terminated, truncated, _ = env.step(a_exec)
         done = terminated or truncated
@@ -371,7 +151,9 @@ def _record_rollout(env, controller, scenario_baseline, seed: int,
                 obs, a_baseline, training=False
             )
             a_exec  = np.asarray(a_exec,  dtype=np.float32)
-            a_agent = np.asarray(a_agent, dtype=np.float32)
+            # Agent-decision mode returns the augmented action (a^a, a^decision);
+            # record only the physical action so the schema stays [.., action_dim].
+            a_agent = np.asarray(a_agent, dtype=np.float32)[:a_exec.shape[-1]]
             tk = 1.0 if used_agent else 0.0
         else:
             a_exec, _ = controller.predict(obs)
@@ -415,8 +197,8 @@ def run_rollouts(
     n_seeds:     int  = 10,
     use_oracle:  bool = True,
     mpc_horizon: int  = 20,
-    models_dir:  str  = "outputs/models",
     output_dir:  str  = "outputs/rollouts",
+    device:      torch.device = torch.device("cpu")
 ):
     """
     Run every method (PID, NMPC oracle, and the given/discovered models) on the
@@ -427,21 +209,20 @@ def run_rollouts(
     cfg     = SCENARIOS[scenario]
     n_steps = cfg["n_steps"]
 
-    if not model_paths:
-        model_paths = discover_models(scenario, models_dir)
-        if not model_paths:
-            print(f"  No models found under {models_dir}/{scenario}/. "
-                  "Recording reference controllers only.")
-
     # (slug, label, controller). References first.
     entries: list[tuple[str, str, object]] = [("pid", "PID", cfg["baseline_cls"]())]
     if use_oracle:
         print(f"  Building NMPC oracle (do-mpc + IPOPT, horizon={mpc_horizon})...")
         entries.append(("nmpc_oracle", "NMPC Oracle", NMPCController(cfg, horizon=mpc_horizon)))
+
     for path in model_paths:
-        slug  = Path(path).parent.name
-        entries.append((slug, _label_from_path(path),
-                        load_model(path, cfg["state_dim"], cfg["action_dim"])))
+        slug = Path(path).parent.name
+        ckpt = torch.load(path, weights_only=False, map_location=device)
+        if isinstance(ckpt["type"], ShadowModels):
+            model = get_shadow_model(ckpt["type"]).load(ckpt, device=device)
+        else:
+            model = get_standard_model(ckpt["type"]).load(ckpt, device=device)
+        entries.append((slug, model.label, model))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir  = os.path.join(output_dir, scenario, timestamp)
@@ -452,7 +233,7 @@ def run_rollouts(
     print(f"  Output   : {save_dir}")
     print(f"{'='*62}\n")
 
-    env               = make_env_for(scenario)
+    env = make_env_for(scenario)
     scenario_baseline = cfg["baseline_cls"]()   # shadow switching + baseline column
     methods_meta: list[dict] = []
 
@@ -529,12 +310,12 @@ def main():
         help="NMPC oracle prediction horizon in steps (default: 20)",
     )
     parser.add_argument(
-        "--models-dir", type=str, default="outputs/models",
-        help="Root directory where model checkpoints are stored",
-    )
-    parser.add_argument(
         "--output-dir", type=str, default="outputs/rollouts",
         help="Root directory for rollout outputs (default: outputs/rollouts/)",
+    )
+    parser.add_argument(
+        "--cpu", action="store_true",
+        help="Force to use the CPU."
     )
     args = parser.parse_args()
 
@@ -544,8 +325,8 @@ def main():
         n_seeds=args.n_seeds,
         use_oracle=not args.no_oracle,
         mpc_horizon=args.mpc_horizon,
-        models_dir=args.models_dir,
         output_dir=args.output_dir,
+        device=resolve_device("cpu" if args.cpu else "gpu"),
     )
 
 

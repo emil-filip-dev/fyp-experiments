@@ -1,10 +1,9 @@
+tqdm
 numpy
 matplotlib
-gymnasium
 casadi
 jax[cpu]
 equinox
 diffrax
 do-mpc[full]
-stable-baselines3
 pcgym

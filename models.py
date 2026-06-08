@@ -5,79 +5,71 @@ All RL model definitions for this project. Every agent shares one custom core
 (Actor / Critic / replay buffer); the variants differ only in how decide_action
 behaves, which makes them a clean ablation set:
 
-Shadow models  (used by train_shadow.py)
-----------------------------------------
-  ddpg  — ShadowDDPG  (single critic, Q-value or agent-decision switching)
-  td3   — ShadowTD3   (twin critics, delayed updates, target policy smoothing)
-
-Standard / no-shadow models  (used by train.py)
+Standard / non-shadow models
 -----------------------------------------------
-  ddpg  — PureDDPG    (ShadowDDPG with switching disabled — agent always acts)
-  td3   — PureTD3     (ShadowTD3  with switching disabled)
+  ddpg - DDPG
+  td3  - TD3
+  ppo  - PPO
+
+Shadow models
+----------------------------------------
+  ddpg - ShadowDDPG  (single critic, Q-value or agent-decision switching)
+  td3  - ShadowTD3   (twin critics, delayed updates, target policy smoothing)
 
 These are the fair "standard DDPG/TD3" baselines for shadow mode: identical
 core, hyperparameters, and PID-assisted exploration, differing ONLY in the
-switching decision. (PPO is not supported — shadow switching needs a
+switching decision. (PPO is not supported - shadow switching needs a
 deterministic off-policy actor-critic.)
-
-Stable-Baselines3 backend  (labelled "SB3 DDPG" / "Shadow SB3 DDPG")
--------------------------------------------------------------------
-An alternative, separately-tuned off-the-shelf implementation kept alongside the
-custom core (create_sb3_agent / create_shadow_sb3_agent). Shadow mode is added to
-SB3 by overriding _sample_action so the *executed* (Q-value-switched) action is
-what gets stored in the replay buffer. Lets us test whether shadow switching
-helps a strong, well-tuned learner. Only q-value switching is supported on SB3.
-
-Device helpers
---------------
-  resolve_device(force_cpu) -> torch.device
-  device_label(device)      -> str
 """
-
+import abc
+import copy
+import enum
+import io
 import os
+from abc import abstractmethod
 from collections import deque
+from contextlib import redirect_stdout
+from typing import Self
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from stable_baselines3 import DDPG as SB3DDPG
-from stable_baselines3 import TD3 as SB3TD3
-from stable_baselines3.common.noise import NormalActionNoise
+
+
+class StandardModels(enum.StrEnum):
+    DDPG = "ddpg"
+    TD3 = "td3"
+    PPO = "ppo"
+
+class ShadowModels(enum.StrEnum):
+    DDPG = "ddpg"
+    TD3 = "td3"
+
+class SwitchingMode(enum.StrEnum):
+    Q_VALUE = "qvalue"
+    AGENT = "agent"
+
+class TD3SwitchCritic(enum.StrEnum):
+    """Which twin-critic estimate ShadowTD3 uses for Q-value switching."""
+    Q_MIN = "qmin"   # min(Q1, Q2) — conservative
+    Q1    = "q1"     # Q1 only — consistent with the actor's objective
+
+def get_standard_model(model_name: str | StandardModels):
+    match model_name:
+        case StandardModels.DDPG.value | StandardModels.DDPG: return DDPG
+        case StandardModels.TD3.value | StandardModels.TD3: return TD3
+        case _: raise ValueError(f"Standard model '{model_name}' does not exist.")
+
+def get_shadow_model(model_name: str | ShadowModels):
+    match model_name:
+        case ShadowModels.DDPG.value | ShadowModels.DDPG: return ShadowDDPG
+        case ShadowModels.TD3.value | ShadowModels.TD3: return ShadowTD3
+        case _: raise ValueError(f"Shadow model '{model_name}' does not exist.")
 
 
 # ---------------------------------------------------------------------------
-# Device helpers
-# ---------------------------------------------------------------------------
-
-def resolve_device(force_cpu: bool = False) -> torch.device:
-    """
-    Return the compute device to use for training/inference.
-    Priority: CUDA GPU → CPU.  Pass force_cpu=True (or --cpu) to skip the GPU.
-    """
-    if not force_cpu and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def device_label(device: torch.device) -> str:
-    """Human-readable device description for log headers."""
-    if device.type == "cuda":
-        return f"GPU — {torch.cuda.get_device_name(0)}"
-    return "CPU"
-
-
-# ---------------------------------------------------------------------------
-# Available model names
-# ---------------------------------------------------------------------------
-
-SHADOW_MODELS = ["ddpg", "td3"]
-PURE_MODELS   = ["ddpg", "td3"]   # standard (no-shadow) custom agents
-SB3_MODELS    = ["ddpg", "td3"]   # Stable-Baselines3 backend (normal + shadow)
-
-
-# ---------------------------------------------------------------------------
-# Neural network building blocks  (shared by ShadowDDPG and ShadowTD3)
+# Neural network building blocks
 # ---------------------------------------------------------------------------
 
 class Actor(nn.Module):
@@ -89,11 +81,16 @@ class Actor(nn.Module):
                     controls how often the agent takes over from the baseline.
     """
 
-    def __init__(self, state_dim: int, action_dim: int, hidden: int = 256,
-                 agent_decision: bool = False):
+    def __init__(
+            self,
+            state_dim: int,
+            action_dim: int,
+            hidden: int = 256,
+            switching_mode: SwitchingMode = SwitchingMode.Q_VALUE
+    ):
         super().__init__()
-        self.agent_decision = agent_decision
-        out_dim = action_dim + 1 if agent_decision else action_dim
+        self.switching_mode = switching_mode
+        out_dim = action_dim + 1 if switching_mode is SwitchingMode.AGENT else action_dim
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden),   nn.ReLU(),
@@ -102,9 +99,10 @@ class Actor(nn.Module):
 
     def forward(self, state: torch.Tensor):
         out = self.net(state)
-        if self.agent_decision:
+        if self.switching_mode is SwitchingMode.AGENT:
             return torch.tanh(out[..., :-1]), torch.sigmoid(out[..., -1:])
-        return torch.tanh(out)
+        else:
+            return torch.tanh(out)
 
 
 class Critic(nn.Module):
@@ -113,8 +111,10 @@ class Critic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden: int = 256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden),                 nn.ReLU(),
+            nn.Linear(state_dim + action_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, 1),
         )
 
@@ -122,9 +122,9 @@ class Critic(nn.Module):
         return self.net(torch.cat([state, action], dim=-1))
 
 
-class _CriticTwin(nn.Module):
+class CriticTwin(nn.Module):
     """
-    Twin Q-networks Q1, Q2 — used by ShadowTD3.
+    Twin Q-networks Q1, Q2 - used by ShadowTD3.
     min(Q1, Q2) reduces overestimation and gives more conservative switching.
     """
 
@@ -132,13 +132,17 @@ class _CriticTwin(nn.Module):
         super().__init__()
         in_dim = state_dim + action_dim
         self.q1 = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, 1),
         )
         self.q2 = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, 1),
         )
 
@@ -160,15 +164,21 @@ class ReplayBuffer:
     def __init__(self, capacity: int = 100_000):
         self.buf = deque(maxlen=capacity)
 
-    def push(self, state, action_exec, reward, next_state, done,
-             action_agent=None, action_baseline=None):
+    def push(
+            self,
+            state,
+            action_exec,
+            reward,
+            next_state,
+            done,
+            action_agent=None,
+            action_baseline=None
+    ):
         self.buf.append((
             np.array(state,           dtype=np.float32),
-            np.array(action_exec,     dtype=np.float32),
-            float(reward),
-            np.array(next_state,      dtype=np.float32),
-            float(done),
-            np.array(action_agent,    dtype=np.float32) if action_agent    is not None else None,
+            np.array(action_exec,     dtype=np.float32), float(reward),
+            np.array(next_state,      dtype=np.float32), float(done),
+            np.array(action_agent,    dtype=np.float32) if action_agent is not None else None,
             np.array(action_baseline, dtype=np.float32) if action_baseline is not None else None,
         ))
 
@@ -190,11 +200,179 @@ class ReplayBuffer:
         return len(self.buf)
 
 
-# ---------------------------------------------------------------------------
-# ShadowDDPG — single-critic shadow agent  (Gassert & Althoff, 2024)
-# ---------------------------------------------------------------------------
+class _ShadowModel(abc.ABC):
 
-class ShadowDDPG:
+    def __init__(
+            self,
+            state_dim: int = 3,
+            action_dim: int = 1,
+            switching_mode: SwitchingMode = SwitchingMode.Q_VALUE,
+            gamma: float = 0.99,
+            tau: float = 0.005,
+            buffer_size: int = 100_000,
+            batch_size: int = 256,
+            eta_agent: float = 0.5,
+            lambda_reg: float = 0.0,
+            noise_std: float = 0.1,
+            warmup_steps: int = 5_000,
+            max_t_train_frac: float = 0.5,
+            device: torch.device = torch.device("cpu"),
+            **kwargs
+    ):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.mode = switching_mode
+        self.gamma = gamma
+        self.tau = tau
+        self.batch_size = batch_size
+        self.eta_agent = eta_agent
+        self.lambda_reg = lambda_reg
+        self.noise_std = noise_std
+        self.warmup_steps = warmup_steps
+        self.max_t_train_frac = max_t_train_frac
+        self.device = device
+
+        self.buffer = ReplayBuffer(buffer_size)
+        self.total_steps = 0
+        self.agent_takeover_count = 0
+        self.baseline_count = 0
+
+    @property
+    @abstractmethod
+    def label(self) -> str:
+        ...
+
+    @property
+    @abstractmethod
+    def _actor(self):
+        ...
+
+    @property
+    @abstractmethod
+    def _critic(self):
+        ...
+
+    def _get_agent_action(self, state: np.ndarray):
+        s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            match self.mode:
+                case SwitchingMode.AGENT:
+                    action, decision = self._actor(s)
+                    return action.cpu().numpy()[0], float(decision.cpu().numpy()[0][0])
+                case _:
+                    action = self._actor(s)
+                    return action.cpu().numpy()[0], None
+
+    def _actor_action(self, actor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Actor output as a single action tensor for the critic. In agent-decision
+        mode the policy emits (a^a, a^decision); the critic operates on the
+        augmented action, so concatenate the two heads.
+        """
+        out = actor(x)
+        if self.mode is SwitchingMode.AGENT:
+            return torch.cat(out, dim=-1)
+        return out
+
+    def _baseline_record_action(self, baseline_action: np.ndarray) -> np.ndarray:
+        """
+        Agent action stored in the replay buffer when the baseline is executed by
+        force (warmup). Agent-decision mode stores the augmented action
+        (a^b, decision=0) so the critic's input width stays constant.
+        """
+        a = np.asarray(baseline_action, dtype=np.float32)
+        if self.mode is SwitchingMode.AGENT:
+            return np.concatenate([a, np.zeros(1, dtype=np.float32)])
+        return a.copy()
+
+    def decide_action(
+            self,
+            obs: np.ndarray,
+            baseline_action: np.ndarray,
+            training: bool = True,
+            force_baseline: bool = False,
+    ):
+        # Warmup / randomised start: execute the baseline, but store a shape-
+        # consistent agent action so agent-decision buffers stack cleanly.
+        if force_baseline:
+            return baseline_action, False, self._baseline_record_action(baseline_action)
+
+        noise = (
+            np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
+            if training else np.zeros(self.action_dim, dtype=np.float32)
+        )
+        action_det, decision_prob = self._get_agent_action(obs)
+        action_noisy = np.clip(action_det + noise, -1.0, 1.0)
+
+        match self.mode:
+            case SwitchingMode.Q_VALUE:
+                # Eq. (6): compare on the DETERMINISTIC policy action a^a = pi^a(s);
+                # the exploration-noised action is what actually gets executed.
+                use_agent = self._decide_qvalue(
+                    torch.FloatTensor(obs).unsqueeze(0).to(self.device),
+                    torch.FloatTensor(action_det).unsqueeze(0).to(self.device),
+                    torch.FloatTensor(baseline_action).unsqueeze(0).to(self.device)
+                )
+                a_agent = action_noisy
+            case _:
+                # Eq. (4): explore the decision too, then store the augmented
+                # behaviour action (a^a, a^decision) so the critic can learn the
+                # value of the decision and train the decision head.
+                decision = (
+                    float(np.clip(decision_prob + np.random.normal(0, self.noise_std), 0.0, 1.0))
+                    if training else decision_prob
+                )
+                use_agent = self._decide_agent(decision)
+                a_agent = np.concatenate(
+                    [action_noisy, np.array([decision], dtype=np.float32)]
+                )
+
+        if use_agent:
+            self.agent_takeover_count += 1
+            return action_noisy, True, a_agent
+        else:
+            self.baseline_count += 1
+            return baseline_action, False, a_agent
+
+    @abstractmethod
+    def _decide_qvalue(self, state, action_agent, action_baseline) -> bool:
+        ...
+
+    @abstractmethod
+    def _decide_agent(self, decision_prob) -> bool:
+        ...
+
+    def store(
+            self, state, action_exec, reward, next_state, done, action_agent, action_baseline
+    ):
+        self.buffer.push(
+            state, action_exec, reward, next_state, done, action_agent, action_baseline
+        )
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(self._save_dict(), path)
+
+    @abstractmethod
+    def _save_dict(self) -> dict:
+        ...
+
+    @classmethod
+    def load(cls, ckpt: dict, device: torch.device = torch.device("cpu")) -> Self:
+        model = cls(**ckpt, device=device)
+        sd = ckpt["state_dicts"]
+        model._load_state_dicts(sd)
+        intern = ckpt["internal"]
+        for k, v in intern.items():
+            model.__setattr__(k, v)
+        return model
+
+    @abstractmethod
+    def _load_state_dicts(self, sd: dict):
+        ...
+
+
+class ShadowDDPG(_ShadowModel):
     """
     DDPG agent trained in shadow mode.
 
@@ -213,7 +391,7 @@ class ShadowDDPG:
         self,
         state_dim:        int   = 3,
         action_dim:       int   = 1,
-        mode:             str   = "qvalue",
+        switching_mode:   SwitchingMode = SwitchingMode.Q_VALUE,
         gamma:            float = 0.99,
         tau:              float = 0.005,
         lr_actor:         float = 1e-4,
@@ -226,107 +404,97 @@ class ShadowDDPG:
         noise_std:        float = 0.1,
         warmup_steps:     int   = 5_000,
         max_t_train_frac: float = 0.5,
-        device:           str   = "cpu",
+        device:           torch.device = torch.device("cpu"),
+        **kwargs
     ):
-        self.mode             = mode
-        self.gamma            = gamma
-        self.tau              = tau
-        self.batch_size       = batch_size
-        self.eta_agent        = eta_agent
-        self.lambda_reg       = lambda_reg
-        self.noise_std        = noise_std
-        self.warmup_steps     = warmup_steps
-        self.max_t_train_frac = max_t_train_frac
-        self.action_dim       = action_dim
-        self.device           = torch.device(device)
+        super().__init__(
+            state_dim, action_dim, switching_mode, gamma, tau, buffer_size, batch_size, eta_agent, lambda_reg,
+            noise_std, warmup_steps, max_t_train_frac, device, **kwargs
+        )
 
-        agent_decision = (mode == "agent")
-
-        self.actor        = Actor(state_dim, action_dim, hidden, agent_decision).to(self.device)
-        self.actor_target = Actor(state_dim, action_dim, hidden, agent_decision).to(self.device)
+        self.hidden = hidden
+        # Agent-decision mode augments the action with a^decision, so the critic
+        # operates on (a^a, a^decision) -> action_dim + 1 inputs.
+        q_action_dim = action_dim + 1 if switching_mode is SwitchingMode.AGENT else action_dim
+        self.actor        = Actor(state_dim, action_dim, hidden, switching_mode).to(self.device)
+        self.actor_target = Actor(state_dim, action_dim, hidden, switching_mode).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        self.critic        = Critic(state_dim, action_dim, hidden).to(self.device)
-        self.critic_target = Critic(state_dim, action_dim, hidden).to(self.device)
+        self.critic        = Critic(state_dim, q_action_dim, hidden).to(self.device)
+        self.critic_target = Critic(state_dim, q_action_dim, hidden).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         self.opt_actor  = torch.optim.Adam(self.actor.parameters(),  lr=lr_actor)
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-        self.buffer               = ReplayBuffer(buffer_size)
-        self.total_steps          = 0
-        self.agent_takeover_count = 0
-        self.baseline_count       = 0
+    @property
+    def _actor(self):
+        return self.actor
 
-    def _get_agent_action(self, state: np.ndarray):
-        s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+    @property
+    def _critic(self):
+        return self.critic
+
+    @property
+    def label(self) -> str:
+        match self.mode:
+            case SwitchingMode.AGENT: mode_label = " (Agent)"
+            case SwitchingMode.Q_VALUE: mode_label = " (Q Value)"
+            case _: mode_label = ""
+        return f"Shadow DDPG{mode_label}"
+
+    def _decide_qvalue(self, state, action_agent, action_baseline) -> bool:
+        # Eq. (6): take over when the single online critic rates the agent's
+        # action above the baseline's.
         with torch.no_grad():
-            if self.mode == "agent":
-                action, decision = self.actor(s)
-                return action.cpu().numpy()[0], float(decision.cpu().numpy()[0][0])
-            action = self.actor(s)
-            return action.cpu().numpy()[0], None
+            q_agent    = self.critic(state, action_agent).item()
+            q_baseline = self.critic(state, action_baseline).item()
+        return q_agent > q_baseline
 
-    def decide_action(self, obs: np.ndarray, baseline_action: np.ndarray,
-                      training: bool = True):
-        noise = (
-            np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
-            if training else np.zeros(self.action_dim, dtype=np.float32)
-        )
-        action_agent, decision_prob = self._get_agent_action(obs)
-        action_noisy = np.clip(action_agent + noise, -1.0, 1.0)
-
-        if self.mode == "qvalue":
-            s    = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            a_ag = torch.FloatTensor(action_noisy).unsqueeze(0).to(self.device)
-            a_bl = torch.FloatTensor(baseline_action).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                q_agent    = self.critic(s, a_ag).item()
-                q_baseline = self.critic(s, a_bl).item()
-            used_agent = q_agent > q_baseline
-        else:
-            used_agent = decision_prob > self.eta_agent
-
-        if used_agent:
-            self.agent_takeover_count += 1
-            return action_noisy, True, action_noisy
-        else:
-            self.baseline_count += 1
-            return baseline_action, False, action_noisy
-
-    def store(self, state, action_exec, reward, next_state, done,
-              action_agent, action_baseline):
-        self.buffer.push(state, action_exec, reward, next_state, done,
-                         action_agent, action_baseline)
+    def _decide_agent(self, decision_prob) -> bool:
+        # Eq. (4): take over when the agent's control-authority probability
+        # exceeds the threshold.
+        return decision_prob > self.eta_agent
 
     def update(self):
         if len(self.buffer) < self.batch_size:
             return
 
-        s, a_exec, r, ns, d, _, a_baseline = self.buffer.sample(self.batch_size)
+        s, a_exec, r, ns, d, a_agent, a_baseline = self.buffer.sample(self.batch_size)
         s      = s.to(self.device)
         a_exec = a_exec.to(self.device)
         r      = r.to(self.device)
         ns     = ns.to(self.device)
         d      = d.to(self.device)
+        if a_agent is not None:
+            a_agent = a_agent.to(self.device)
+
+        # In agent-decision mode the critic learns Q over the augmented behaviour
+        # action (a^a, a^decision); in q-value mode it learns Q over the executed
+        # action a^c (which may be the baseline).
+        a_critic = a_agent if self.mode is SwitchingMode.AGENT else a_exec
+
+        # Eq. (5): reward penalty r^reg = -lambda * ||a^a - a^b|| regularising the
+        # agent toward the baseline. Agent-decision switching only; it shapes the
+        # reward (hence the Q-function), not the actor loss directly.
+        if self.mode is SwitchingMode.AGENT and self.lambda_reg > 0 and a_agent is not None:
+            r = r - self.lambda_reg * torch.norm(
+                a_agent[:, :self.action_dim] - a_baseline.to(self.device), dim=-1, keepdim=True
+            )
 
         with torch.no_grad():
-            a_next   = (self.actor_target(ns)[0] if self.mode == "agent"
-                        else self.actor_target(ns))
+            a_next   = self._actor_action(self.actor_target, ns)
             q_target = r + self.gamma * (1 - d) * self.critic_target(ns, a_next)
 
-        critic_loss = F.mse_loss(self.critic(s, a_exec), q_target)
+        critic_loss = F.mse_loss(self.critic(s, a_critic), q_target)
         self.opt_critic.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.opt_critic.step()
 
-        a_cur      = (self.actor(s)[0] if self.mode == "agent" else self.actor(s))
+        a_cur      = self._actor_action(self.actor, s)
         actor_loss = -self.critic(s, a_cur).mean()
-        if self.lambda_reg > 0 and a_baseline is not None:
-            actor_loss = actor_loss + self.lambda_reg * F.l1_loss(
-                a_cur, a_baseline.to(self.device)
-            )
+
         self.opt_actor.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
@@ -337,28 +505,47 @@ class ShadowDDPG:
         for p, tp in zip(self.actor.parameters(), self.actor_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-    def save(self, path: str):
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save({
-            "actor":         self.actor.state_dict(),
-            "actor_target":  self.actor_target.state_dict(),
-            "critic":        self.critic.state_dict(),
-            "critic_target": self.critic_target.state_dict(),
-        }, path)
+    def _save_dict(self) -> dict:
+        return {
+            "type": ShadowModels.DDPG,
+            "switching_mode": self.mode,
+            "gamma": self.gamma,
+            "tau": self.tau,
+            "batch_size": self.batch_size,
+            "eta_agent": self.eta_agent,
+            "lambda_reg": self.lambda_reg,
+            "noise_std": self.noise_std,
+            "warmup_steps": self.warmup_steps,
+            "max_t_train_frac": self.max_t_train_frac,
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+            "hidden": self.hidden,
+            "state_dicts": {
+                "actor": self.actor.state_dict(),
+                "actor_target": self.actor_target.state_dict(),
+                "critic": self.critic.state_dict(),
+                "critic_target": self.critic_target.state_dict(),
+                "opt_actor": self.opt_actor.state_dict(),
+                "opt_critic": self.opt_critic.state_dict(),
+            },
+            "internal": {
+                "buffer": self.buffer,
+                "total_steps": self.total_steps,
+                "agent_takeover_count": self.agent_takeover_count,
+                "baseline_count": self.baseline_count
+            }
+        }
 
-    def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
-        self.actor.load_state_dict(ckpt["actor"])
-        self.actor_target.load_state_dict(ckpt.get("actor_target", ckpt["actor"]))
-        self.critic.load_state_dict(ckpt["critic"])
-        self.critic_target.load_state_dict(ckpt.get("critic_target", ckpt["critic"]))
+    def _load_state_dicts(self, sd: dict):
+        self.actor.load_state_dict(sd["actor"])
+        self.actor_target.load_state_dict(sd.get("actor_target", sd["actor"]))
+        self.critic.load_state_dict(sd["critic"])
+        self.critic_target.load_state_dict(sd.get("critic_target", sd["critic"]))
+        self.opt_actor.load_state_dict(sd["opt_actor"])
+        self.opt_critic.load_state_dict(sd["opt_critic"])
 
 
-# ---------------------------------------------------------------------------
-# ShadowTD3 — twin-critic shadow agent
-# ---------------------------------------------------------------------------
-
-class ShadowTD3:
+class ShadowTD3(_ShadowModel):
     """
     TD3 agent trained in shadow mode.
 
@@ -376,7 +563,7 @@ class ShadowTD3:
         self,
         state_dim:          int   = 3,
         action_dim:         int   = 1,
-        mode:               str   = "qvalue",
+        switching_mode:     SwitchingMode = SwitchingMode.Q_VALUE,
         gamma:              float = 0.99,
         tau:                float = 0.005,
         lr_actor:           float = 1e-4,
@@ -391,106 +578,115 @@ class ShadowTD3:
         policy_delay:       int   = 2,
         target_noise_std:   float = 0.2,
         target_noise_clip:  float = 0.5,
+        switch_critic:      TD3SwitchCritic = TD3SwitchCritic.Q1,
         max_t_train_frac:   float = 0.5,
-        device:             str   = "cpu",
+        device:             torch.device = torch.device("cpu"),
+        **kwargs
     ):
-        self.mode              = mode
-        self.gamma             = gamma
-        self.tau               = tau
-        self.batch_size        = batch_size
-        self.eta_agent         = eta_agent
-        self.lambda_reg        = lambda_reg
-        self.noise_std         = noise_std
-        self.warmup_steps      = warmup_steps
+        super().__init__(
+            state_dim, action_dim, switching_mode, gamma, tau, buffer_size, batch_size, eta_agent, lambda_reg,
+            noise_std, warmup_steps, max_t_train_frac, device, **kwargs
+        )
+
         self.policy_delay      = policy_delay
         self.target_noise_std  = target_noise_std
         self.target_noise_clip = target_noise_clip
-        self.max_t_train_frac  = max_t_train_frac
-        self.action_dim        = action_dim
-        self.device            = torch.device(device)
+        self.switch_critic     = TD3SwitchCritic(switch_critic)
 
-        agent_decision = (mode == "agent")
-
-        self.actor        = Actor(state_dim, action_dim, hidden, agent_decision).to(self.device)
-        self.actor_target = Actor(state_dim, action_dim, hidden, agent_decision).to(self.device)
+        self.hidden = hidden
+        # Agent-decision mode augments the action with a^decision, so the critic
+        # operates on (a^a, a^decision) -> action_dim + 1 inputs.
+        q_action_dim = action_dim + 1 if switching_mode is SwitchingMode.AGENT else action_dim
+        self.actor        = Actor(state_dim, action_dim, hidden, switching_mode).to(self.device)
+        self.actor_target = Actor(state_dim, action_dim, hidden, switching_mode).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        self.critic        = _CriticTwin(state_dim, action_dim, hidden).to(self.device)
-        self.critic_target = _CriticTwin(state_dim, action_dim, hidden).to(self.device)
+        self.critic        = CriticTwin(state_dim, q_action_dim, hidden).to(self.device)
+        self.critic_target = CriticTwin(state_dim, q_action_dim, hidden).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         self.opt_actor  = torch.optim.Adam(self.actor.parameters(),  lr=lr_actor)
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-        self.buffer               = ReplayBuffer(buffer_size)
-        self.total_steps          = 0
-        self._update_count        = 0
-        self.agent_takeover_count = 0
-        self.baseline_count       = 0
+        self._update_count = 0
 
-    def _get_agent_action(self, state: np.ndarray):
-        s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+    @property
+    def _actor(self):
+        return self.actor
+
+    @property
+    def _critic(self):
+        return self.critic
+
+    @property
+    def label(self) -> str:
+        match self.mode:
+            case SwitchingMode.AGENT: mode_label = " (Agent)"
+            case SwitchingMode.Q_VALUE: mode_label = f" (Q Value, {self.switch_critic.value})"
+            case _: mode_label = ""
+        return f"Shadow TD3{mode_label}"
+
+    def _decide_qvalue(self, state, action_agent, action_baseline) -> bool:
+        # Eq. (6): take over when the chosen twin-critic estimate rates the
+        # agent's action above the baseline's. q1 is consistent with the actor's
+        # objective; qmin is the conservative min(Q1, Q2).
+        match self.switch_critic:
+            case TD3SwitchCritic.Q_MIN: q = self.critic.q_min
+            case _:                     q = self.critic.q1_only
         with torch.no_grad():
-            if self.mode == "agent":
-                action, decision = self.actor(s)
-                return action.cpu().numpy()[0], float(decision.cpu().numpy()[0][0])
-            action = self.actor(s)
-            return action.cpu().numpy()[0], None
+            q_agent    = q(state, action_agent).item()
+            q_baseline = q(state, action_baseline).item()
+        return q_agent > q_baseline
 
-    def decide_action(self, obs: np.ndarray, baseline_action: np.ndarray,
-                      training: bool = True):
-        noise = (
-            np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
-            if training else np.zeros(self.action_dim, dtype=np.float32)
-        )
-        action_agent, decision_prob = self._get_agent_action(obs)
-        action_noisy = np.clip(action_agent + noise, -1.0, 1.0)
-
-        if self.mode == "qvalue":
-            s    = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            a_ag = torch.FloatTensor(action_noisy).unsqueeze(0).to(self.device)
-            a_bl = torch.FloatTensor(baseline_action).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                q_agent    = self.critic.q_min(s, a_ag).item()
-                q_baseline = self.critic.q_min(s, a_bl).item()
-            used_agent = q_agent > q_baseline
-        else:
-            used_agent = decision_prob > self.eta_agent
-
-        if used_agent:
-            self.agent_takeover_count += 1
-            return action_noisy, True, action_noisy
-        else:
-            self.baseline_count += 1
-            return baseline_action, False, action_noisy
-
-    def store(self, state, action_exec, reward, next_state, done,
-              action_agent, action_baseline):
-        self.buffer.push(state, action_exec, reward, next_state, done,
-                         action_agent, action_baseline)
+    def _decide_agent(self, decision_prob) -> bool:
+        # Eq. (4): take over when the agent's control-authority probability
+        # exceeds the threshold.
+        return decision_prob > self.eta_agent
 
     def update(self):
         if len(self.buffer) < self.batch_size:
             return
 
-        s, a_exec, r, ns, d, _, a_baseline = self.buffer.sample(self.batch_size)
+        s, a_exec, r, ns, d, a_agent, a_baseline = self.buffer.sample(self.batch_size)
         s      = s.to(self.device)
         a_exec = a_exec.to(self.device)
         r      = r.to(self.device)
         ns     = ns.to(self.device)
         d      = d.to(self.device)
+        if a_agent is not None:
+            a_agent = a_agent.to(self.device)
+
+        # In agent-decision mode the critic learns Q over the augmented behaviour
+        # action (a^a, a^decision); in q-value mode it learns Q over the executed
+        # action a^c (which may be the baseline).
+        a_critic = a_agent if self.mode is SwitchingMode.AGENT else a_exec
+
+        # Eq. (5): reward penalty r^reg = -lambda * ||a^a - a^b|| regularising the
+        # agent toward the baseline. Agent-decision switching only; it shapes the
+        # reward (hence the Q-function), not the actor loss directly.
+        if self.mode is SwitchingMode.AGENT and self.lambda_reg > 0 and a_agent is not None:
+            r = r - self.lambda_reg * torch.norm(
+                a_agent[:, :self.action_dim] - a_baseline.to(self.device), dim=-1, keepdim=True
+            )
 
         with torch.no_grad():
-            a_next = (self.actor_target(ns)[0] if self.mode == "agent"
-                      else self.actor_target(ns))
+            a_next    = self._actor_action(self.actor_target, ns)
             smoothing = torch.clamp(
                 torch.randn_like(a_next) * self.target_noise_std,
                 -self.target_noise_clip, self.target_noise_clip,
             )
-            a_next   = torch.clamp(a_next + smoothing, -1.0, 1.0)
+            a_next = a_next + smoothing
+            if self.mode is SwitchingMode.AGENT:
+                # action dims live in [-1, 1] (tanh); the decision dim lives in [0, 1].
+                a_next = torch.cat([
+                    a_next[:, :self.action_dim].clamp(-1.0, 1.0),
+                    a_next[:, self.action_dim:].clamp(0.0, 1.0),
+                ], dim=-1)
+            else:
+                a_next = a_next.clamp(-1.0, 1.0)
             q_target = r + self.gamma * (1 - d) * self.critic_target.q_min(ns, a_next)
 
-        q1, q2      = self.critic(s, a_exec)
+        q1, q2      = self.critic(s, a_critic)
         critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
         self.opt_critic.zero_grad()
         critic_loss.backward()
@@ -501,12 +697,9 @@ class ShadowTD3:
         if self._update_count % self.policy_delay != 0:
             return
 
-        a_cur      = (self.actor(s)[0] if self.mode == "agent" else self.actor(s))
+        a_cur      = self._actor_action(self.actor, s)
         actor_loss = -self.critic.q1_only(s, a_cur).mean()
-        if self.lambda_reg > 0 and a_baseline is not None:
-            actor_loss = actor_loss + self.lambda_reg * F.l1_loss(
-                a_cur, a_baseline.to(self.device)
-            )
+
         self.opt_actor.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
@@ -517,25 +710,53 @@ class ShadowTD3:
         for p, tp in zip(self.actor.parameters(), self.actor_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-    def save(self, path: str):
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save({
-            "actor":            self.actor.state_dict(),
-            "actor_target":     self.actor_target.state_dict(),
-            "critic_q1":        self.critic.q1.state_dict(),
-            "critic_q2":        self.critic.q2.state_dict(),
-            "critic_target_q1": self.critic_target.q1.state_dict(),
-            "critic_target_q2": self.critic_target.q2.state_dict(),
-        }, path)
+    def _save_dict(self):
+        return {
+            "type": ShadowModels.TD3,
+            "switching_mode": self.mode,
+            "gamma": self.gamma,
+            "tau": self.tau,
+            "batch_size": self.batch_size,
+            "eta_agent": self.eta_agent,
+            "lambda_reg": self.lambda_reg,
+            "noise_std": self.noise_std,
+            "warmup_steps": self.warmup_steps,
+            "policy_delay": self.policy_delay,
+            "target_noise_std": self.target_noise_std,
+            "target_noise_clip": self.target_noise_clip,
+            "switch_critic": self.switch_critic,
+            "max_t_train_frac": self.max_t_train_frac,
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+            "hidden": self.hidden,
+            "state_dicts": {
+                "actor": self.actor.state_dict(),
+                "actor_target": self.actor_target.state_dict(),
+                "critic_q1": self.critic.q1.state_dict(),
+                "critic_q2": self.critic.q2.state_dict(),
+                "critic_target_q1": self.critic_target.q1.state_dict(),
+                "critic_target_q2": self.critic_target.q2.state_dict(),
+                "opt_actor": self.opt_actor.state_dict(),
+                "opt_critic": self.opt_critic.state_dict(),
+            },
+            "internal": {
+                "buffer": self.buffer,
+                "total_steps": self.total_steps,
+                "_update_count": self._update_count,
+                "agent_takeover_count": self.agent_takeover_count,
+                "baseline_count": self.baseline_count
+            }
+        }
 
-    def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
-        self.actor.load_state_dict(ckpt["actor"])
-        self.actor_target.load_state_dict(ckpt.get("actor_target", ckpt["actor"]))
-        self.critic.q1.load_state_dict(ckpt["critic_q1"])
-        self.critic.q2.load_state_dict(ckpt["critic_q2"])
-        self.critic_target.q1.load_state_dict(ckpt.get("critic_target_q1", ckpt["critic_q1"]))
-        self.critic_target.q2.load_state_dict(ckpt.get("critic_target_q2", ckpt["critic_q2"]))
+    def _load_state_dicts(self, sd: dict):
+        self.actor.load_state_dict(sd["actor"])
+        self.actor_target.load_state_dict(sd.get("actor_target", sd["actor"]))
+        self.critic.q1.load_state_dict(sd["critic_q1"])
+        self.critic.q2.load_state_dict(sd["critic_q2"])
+        self.critic_target.q1.load_state_dict(sd.get("critic_target_q1", sd["critic_q1"]))
+        self.critic_target.q2.load_state_dict(sd.get("critic_target_q2", sd["critic_q2"]))
+        self.opt_actor.load_state_dict(sd["opt_actor"])
+        self.opt_critic.load_state_dict(sd["opt_critic"])
 
 
 # ---------------------------------------------------------------------------
@@ -544,13 +765,52 @@ class ShadowTD3:
 # These share the ShadowDDPG / ShadowTD3 core exactly but disable shadow-mode
 # switching: the agent's own action is always executed. They are the correct
 # "standard DDPG/TD3" baseline for measuring the *effect of shadow switching*,
-# since the learner is held identical (unlike the SB3 agents in train.py, which
-# are a different, separately-tuned implementation).
+# since the learner is held identical.
 
-class PureDDPG(ShadowDDPG):
+class DDPG(ShadowDDPG):
     """Standard DDPG: always executes the agent's action, no shadow switching."""
 
-    def decide_action(self, obs, baseline_action, training: bool = True):
+    def __init__(
+            self,
+            state_dim: int = 3,
+            action_dim: int = 1,
+            gamma: float = 0.99,
+            tau: float = 0.005,
+            lr_actor: float = 1e-4,
+            lr_critic: float = 3e-4,
+            hidden: int = 256,
+            buffer_size: int = 100_000,
+            batch_size: int = 256,
+            noise_std: float = 0.1,
+            warmup_steps: int = 5_000,
+            max_t_train_frac: float = 0.5,
+            device: torch.device = torch.device("cpu"),
+            **kwargs
+    ):
+        super().__init__(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            gamma=gamma,
+            tau=tau,
+            lr_actor=lr_actor,
+            lr_critic=lr_critic,
+            hidden=hidden,
+            buffer_size=buffer_size,
+            batch_size=batch_size,
+            noise_std=noise_std,
+            warmup_steps=warmup_steps,
+            max_t_train_frac=max_t_train_frac,
+            device=device,
+            **kwargs
+        )
+
+    @property
+    def label(self) -> str:
+        return f"DDPG"
+
+    def decide_action(self, obs, baseline_action, training: bool = True, force_baseline: bool = False):
+        if force_baseline:
+            return baseline_action, False, np.asarray(baseline_action, dtype=np.float32).copy()
         noise = (
             np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
             if training else np.zeros(self.action_dim, dtype=np.float32)
@@ -560,11 +820,62 @@ class PureDDPG(ShadowDDPG):
         self.agent_takeover_count += 1
         return action_noisy, True, action_noisy
 
+    def _save_dict(self) -> dict:
+        d = super()._save_dict()
+        d["type"] = StandardModels.DDPG
+        return d
 
-class PureTD3(ShadowTD3):
+
+class TD3(ShadowTD3):
     """Standard TD3: always executes the agent's action, no shadow switching."""
 
-    def decide_action(self, obs, baseline_action, training: bool = True):
+    def __init__(
+        self,
+        state_dim:          int   = 3,
+        action_dim:         int   = 1,
+        gamma:              float = 0.99,
+        tau:                float = 0.005,
+        lr_actor:           float = 1e-4,
+        lr_critic:          float = 3e-4,
+        hidden:             int   = 256,
+        buffer_size:        int   = 100_000,
+        batch_size:         int   = 256,
+        noise_std:          float = 0.1,
+        warmup_steps:       int   = 5_000,
+        policy_delay:       int   = 2,
+        target_noise_std:   float = 0.2,
+        target_noise_clip:  float = 0.5,
+        max_t_train_frac:   float = 0.5,
+        device:             torch.device = torch.device("cpu"),
+        **kwargs
+    ):
+        super().__init__(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            gamma=gamma,
+            tau=tau,
+            lr_actor=lr_actor,
+            lr_critic=lr_critic,
+            hidden=hidden,
+            buffer_size=buffer_size,
+            batch_size=batch_size,
+            noise_std=noise_std,
+            warmup_steps=warmup_steps,
+            policy_delay=policy_delay,
+            target_noise_std=target_noise_std,
+            target_noise_clip=target_noise_clip,
+            max_t_train_frac=max_t_train_frac,
+            device=device,
+            **kwargs
+        )
+
+    @property
+    def label(self) -> str:
+        return f"TD3"
+
+    def decide_action(self, obs, baseline_action, training: bool = True, force_baseline: bool = False):
+        if force_baseline:
+            return baseline_action, False, np.asarray(baseline_action, dtype=np.float32).copy()
         noise = (
             np.random.normal(0, self.noise_std, self.action_dim).astype(np.float32)
             if training else np.zeros(self.action_dim, dtype=np.float32)
@@ -574,136 +885,95 @@ class PureTD3(ShadowTD3):
         self.agent_takeover_count += 1
         return action_noisy, True, action_noisy
 
-
-def create_pure_agent(
-    model_type:  str,
-    state_dim:   int,
-    action_dim:  int,
-    device:      torch.device | None = None,
-):
-    """Return an untrained no-shadow custom agent (PureDDPG or PureTD3) — the
-    ablation baseline that shares the shadow agents' core."""
-    dev_str = str(device) if device is not None else "cpu"
-    kwargs  = dict(state_dim=state_dim, action_dim=action_dim, mode="qvalue",
-                   device=dev_str)
-    return PureTD3(**kwargs) if model_type == "td3" else PureDDPG(**kwargs)
+    def _save_dict(self):
+        d = super()._save_dict()
+        d["type"] = StandardModels.TD3
+        return d
 
 
 # ---------------------------------------------------------------------------
-# Shadow agent factory  — used by train_shadow.py
+# NMPC Controller oracle - receding-horizon do-mpc controller (best-achievable reference)
 # ---------------------------------------------------------------------------
 
-def create_shadow_agent(
-    model_type:  str,
-    state_dim:   int,
-    action_dim:  int,
-    mode:        str             = "qvalue",
-    lambda_reg:  float           = 0.0,
-    eta_agent:   float           = 0.5,
-    device:      torch.device | None = None,
-):
-    """Return an untrained shadow-mode agent (ShadowDDPG or ShadowTD3)."""
-    dev_str = str(device) if device is not None else "cpu"
-    kwargs  = dict(state_dim=state_dim, action_dim=action_dim, mode=mode,
-                   lambda_reg=lambda_reg, eta_agent=eta_agent, device=dev_str)
-    return ShadowTD3(**kwargs) if model_type == "td3" else ShadowDDPG(**kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Stable-Baselines3 backend  — "SB3 DDPG" / "Shadow SB3 DDPG"
-# ---------------------------------------------------------------------------
-# A separately-tuned off-the-shelf learner kept alongside the custom core. Shadow
-# mode is added by overriding _sample_action so the *executed* (switched) action
-# is stored in the replay buffer, exactly like the custom ShadowDDPG.
-#
-# Assumes a normalised action space ([-1, 1]) — all project scenarios use
-# normalise_a=True, so SB3's scaled action space equals the env action space and
-# the PID baselines (which output in [-1, 1]) drop in without rescaling.
-
-def _sb3_kwargs(env, seed, device):
-    dev_str   = str(device) if device is not None else "auto"
-    n_actions = env.action_space.shape[0]
-    noise     = NormalActionNoise(mean=np.zeros(n_actions),
-                                  sigma=0.1 * np.ones(n_actions))
-    return dict(policy="MlpPolicy", env=env, seed=seed, verbose=0, device=dev_str,
-                learning_rate=1e-3, batch_size=256, gamma=0.99, tau=0.005,
-                action_noise=noise)
-
-
-class _ShadowSB3Mixin:
+class NMPCController:
     """
-    Adds shadow-mode Q-value switching to an SB3 off-policy actor-critic.
+    Nonlinear MPC oracle for a PC-Gym scenario.
 
-    During data collection the executed action is the baseline's unless the
-    critic prefers the agent's (Q(s, a_agent) > Q(s, a_baseline)). The executed
-    action is what is stored in the replay buffer, so the critic learns the value
-    of the deployed mixed policy. Switching activates only after the warmup
-    (learning_starts), when the critic is usable.
+    Built on PC-Gym's own do-mpc `oracle` (CasADi + IPOPT) so the prediction
+    model is *exactly* the environment's dynamics — the "best achievable"
+    reference. Exposes .predict(obs) / .reset() like the PID baselines and runs
+    in true receding-horizon fashion against the real (noisy) environment.
     """
 
-    baseline = None
+    def __init__(self, cfg: dict, horizon: int = 20):
+        # Imported lazily so --no-oracle runs never pay the do-mpc import cost.
+        from pcgym import make_env
+        from pcgym.oracle import oracle
 
-    def set_baseline(self, baseline):
-        self.baseline     = baseline
-        self._n_decisions = 0      # number of switching decisions (for takeover %)
-        self._n_agent     = 0      # how many chose the agent's action
-        return self
+        # oracle mutates env_params in place, so hand it a private copy.
+        env_params = copy.deepcopy(cfg["env_params"])
+        self._oracle = oracle(make_env, env_params, MPC_params={"N": horizon})
 
-    def reset_baseline(self):
-        if self.baseline is not None:
-            self.baseline.reset()
+        self._nx          = self._oracle.env.Nx_oracle
+        self._a_low       = np.asarray(env_params["a_space"]["low"],  dtype=np.float64)
+        self._a_high      = np.asarray(env_params["a_space"]["high"], dtype=np.float64)
+        self._o_low       = np.asarray(env_params["o_space"]["low"],  dtype=np.float64)
+        self._o_high      = np.asarray(env_params["o_space"]["high"], dtype=np.float64)
+        self._normalise_o = env_params.get("normalise_o", True)
+        self._x0          = np.asarray(cfg["env_params"]["x0"][:self._nx], dtype=np.float64)
 
-    def _q1(self, obs_2d, act_2d):
-        """min-batch Q1(obs, action) as a 1-D numpy array; actions are scaled [-1,1]."""
-        obs_t = self.policy.obs_to_tensor(np.asarray(obs_2d, dtype=np.float32))[0]
-        act_t = torch.as_tensor(np.asarray(act_2d, dtype=np.float32), device=self.device)
-        with torch.no_grad():
-            return self.critic.q1_forward(obs_t, act_t).cpu().numpy().reshape(-1)
+        # Build the NLP once; reset() re-initialises it cheaply each episode.
+        with redirect_stdout(io.StringIO()):
+            self._mpc, _ = self._oracle.setup_mpc()
 
-    def _switch(self, obs_2d, agent_scaled_2d):
-        """Return (executed_scaled_2d, used_agent_bool_array) for a batch of obs."""
-        n      = agent_scaled_2d.shape[0]
-        a_base = np.array([np.asarray(self.baseline.predict(obs_2d[i])[0], dtype=np.float32)
-                           for i in range(n)])
-        use_agent = self._q1(obs_2d, agent_scaled_2d) > self._q1(obs_2d, a_base)
-        executed  = np.where(use_agent[:, None], agent_scaled_2d, a_base).astype(np.float32)
-        return executed, use_agent
+        # PC-Gym's shipped p_fun does `int(t_now/dt - 1)`, which crashes on modern
+        # numpy (do-mpc passes t_now as a 1-D array) and lags the setpoint by one
+        # step. make_step looks up self.p_fun dynamically, so we override it with a
+        # scalar-safe version that tracks the *current* setpoint. Only setpoint
+        # scheduling is supported (no disturbances / delta-u).
+        if self._oracle.has_disturbances or self._oracle.use_delta_u:
+            raise NotImplementedError(
+                "NMPCController supports setpoint-tracking scenarios only "
+                "(no disturbances or delta-u)."
+            )
+        self._mpc.p_fun = self._make_p_fun()
+        self.reset()
 
-    def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
-        action, buffer_action = super()._sample_action(learning_starts, action_noise, n_envs)
-        if self.baseline is None or self.num_timesteps < learning_starts:
-            return action, buffer_action
-        executed, use_agent = self._switch(self._last_obs, buffer_action)
-        self._n_decisions += int(use_agent.size)
-        self._n_agent     += int(use_agent.sum())
-        return self.policy.unscale_action(executed), executed
+    def _make_p_fun(self):
+        """Build a scalar-safe do-mpc parameter function for setpoint tracking."""
+        sp_dict        = self._oracle.env_params["SP"]
+        sp_arrays      = [np.asarray(v, dtype=float) for v in sp_dict.values()]
+        dt             = self._oracle.env.dt
+        get_p_template = self._mpc.get_p_template
 
-    def executed_action(self, obs, baseline):
-        """Deterministic switched action for a single obs (used at evaluation)."""
-        a_agent, _ = self.predict(obs, deterministic=True)
-        a_base     = np.asarray(baseline.predict(obs)[0], dtype=np.float32)
-        q_agent    = self._q1(obs[None], a_agent[None])[0]
-        q_base     = self._q1(obs[None], a_base[None])[0]
-        return a_agent if q_agent > q_base else a_base
+        def p_fun(t_now):
+            t = float(np.asarray(t_now).flatten()[0])
+            k = int(round(t / dt))                       # current step index
+            p_template = get_p_template(1)
+            sp_vals = [arr[min(k, len(arr) - 1)] for arr in sp_arrays]
+            p_template["_p", 0, "SP"] = np.array(sp_vals).reshape(-1, 1)
+            return p_template
 
+        return p_fun
 
-class ShadowSB3DDPG(_ShadowSB3Mixin, SB3DDPG):
-    """SB3 DDPG with shadow-mode Q-value switching."""
+    def reset(self):
+        """Restart for a new episode: reset the MPC clock and initial guess."""
+        self._mpc.reset_history()            # resets internal t0 -> 0 (SP indexing)
+        self._mpc.x0 = self._x0
+        with redirect_stdout(io.StringIO()):
+            self._mpc.set_initial_guess()
 
+    def predict(self, obs, deterministic: bool = True):
+        obs = np.asarray(obs, dtype=np.float64)
+        if self._normalise_o:
+            phys = (obs + 1.0) / 2.0 * (self._o_high - self._o_low) + self._o_low
+        else:
+            phys = obs
+        x0 = phys[:self._nx].reshape(-1, 1)        # physical model state (no setpoints)
 
-class ShadowSB3TD3(_ShadowSB3Mixin, SB3TD3):
-    """SB3 TD3 with shadow-mode Q-value switching."""
+        with redirect_stdout(io.StringIO()):
+            u = np.asarray(self._mpc.make_step(x0)).flatten()   # physical input(s)
 
-
-def create_sb3_agent(model_type: str, env, seed: int = 42,
-                     device: torch.device | None = None):
-    """Return an untrained plain SB3 agent (DDPG or TD3) — the 'SB3 DDPG' baseline."""
-    cls = SB3TD3 if model_type == "td3" else SB3DDPG
-    return cls(**_sb3_kwargs(env, seed, device))
-
-
-def create_shadow_sb3_agent(model_type: str, env, baseline, seed: int = 42,
-                           device: torch.device | None = None):
-    """Return an untrained shadow-mode SB3 agent with the PID baseline attached."""
-    cls = ShadowSB3TD3 if model_type == "td3" else ShadowSB3DDPG
-    return cls(**_sb3_kwargs(env, seed, device)).set_baseline(baseline)
+        # Re-normalise to the env's [-1, 1] action space.
+        u_norm = 2.0 * (u - self._a_low) / (self._a_high - self._a_low) - 1.0
+        return np.clip(u_norm, -1.0, 1.0).astype(np.float32), None
