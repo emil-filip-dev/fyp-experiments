@@ -7,3 +7,5 @@ equinox
 diffrax
 do-mpc[full]
 pcgym
+rliable
+pandas<3  # rliable pins arch<8, whose import breaks against pandas>=3 (deprecate_kwarg); keep pandas on 2.x

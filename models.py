@@ -306,11 +306,12 @@ class _ShadowModel(abc.ABC):
 
         match self.mode:
             case SwitchingMode.Q_VALUE:
-                # Eq. (6): compare on the DETERMINISTIC policy action a^a = pi^a(s);
-                # the exploration-noised action is what actually gets executed.
+                # Eq. (6): compare on the NOISY action that is actually executed
+                # (a^c = a^a + exploration noise), so the switch evaluates exactly
+                # the action we are about to apply to the system.
                 use_agent = self._decide_qvalue(
                     torch.FloatTensor(obs).unsqueeze(0).to(self.device),
-                    torch.FloatTensor(action_det).unsqueeze(0).to(self.device),
+                    torch.FloatTensor(action_noisy).unsqueeze(0).to(self.device),
                     torch.FloatTensor(baseline_action).unsqueeze(0).to(self.device)
                 )
                 a_agent = action_noisy

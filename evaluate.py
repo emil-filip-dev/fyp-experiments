@@ -40,6 +40,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from constraints import constraint_metrics, violation_magnitudes
 from models import NMPCController, ShadowModels, get_shadow_model, get_standard_model
 from scenarios import SCENARIOS, make_env_for
 from util import resolve_device
@@ -117,7 +118,7 @@ def evaluate(env, agent, baseline, n_seeds: int, n_steps: int) -> float:
 # ---------------------------------------------------------------------------
 
 def _record_rollout(env, controller, scenario_baseline, seed: int,
-                    n_steps: int) -> dict:
+                    n_steps: int, constraint_spec: list | None = None) -> dict:
     """
     Run one deterministic episode, recording the full per-step model outputs.
 
@@ -127,8 +128,11 @@ def _record_rollout(env, controller, scenario_baseline, seed: int,
     action column for every method.
 
     Returns arrays of shape [T, ...] (T = episode length):
-      states, obs, actions, actions_agent, actions_baseline, rewards, takeover
+      states, obs, actions, actions_agent, actions_baseline, rewards, takeover,
+      violations
     `takeover` is 1.0 (agent) / 0.0 (baseline) for RL agents, NaN otherwise.
+    `violations` is [T, n_con] per-constraint violation magnitude (>=0; computed
+    from the physical states against `constraint_spec`, [T, 0] if none defined).
     """
     is_agent = hasattr(controller, "decide_action")
 
@@ -173,14 +177,20 @@ def _record_rollout(env, controller, scenario_baseline, seed: int,
         takeover.append(tk)
         step += 1
 
+    states_arr = np.asarray(states, dtype=np.float32)
+    # Per-step, per-constraint violation magnitude, computed directly from the
+    # physical states (see constraints.py for why we avoid PC-Gym's cons_info).
+    violations = violation_magnitudes(states_arr, constraint_spec or []).astype(np.float32)
+
     return {
-        "states":           np.asarray(states,        dtype=np.float32),
+        "states":           states_arr,
         "obs":              np.asarray(observations,  dtype=np.float32),
         "actions":          np.asarray(a_exec_l,      dtype=np.float32),
         "actions_agent":    np.asarray(a_agent_l,     dtype=np.float32),
         "actions_baseline": np.asarray(a_base_l,      dtype=np.float32),
         "rewards":          np.asarray(rewards,       dtype=np.float32),
         "takeover":         np.asarray(takeover,      dtype=np.float32),
+        "violations":       violations,
     }
 
 
@@ -213,7 +223,11 @@ def run_rollouts(
     entries: list[tuple[str, str, object]] = [("pid", "PID", cfg["baseline_cls"]())]
     if use_oracle:
         print(f"  Building NMPC oracle (do-mpc + IPOPT, horizon={mpc_horizon})...")
-        entries.append(("nmpc_oracle", "NMPC Oracle", NMPCController(cfg, horizon=mpc_horizon)))
+        try:
+            entries.append(("nmpc_oracle", "NMPC Oracle", NMPCController(cfg, horizon=mpc_horizon)))
+        except NotImplementedError as e:
+            # e.g. delta-u scenarios (crystallization) — the oracle can't model them.
+            print(f"  [skip oracle] {e}")
 
     for path in model_paths:
         slug = Path(path).parent.name
@@ -235,11 +249,13 @@ def run_rollouts(
 
     env = make_env_for(scenario)
     scenario_baseline = cfg["baseline_cls"]()   # shadow switching + baseline column
+    constraint_spec = cfg.get("constraint_spec", [])
     methods_meta: list[dict] = []
 
     for slug, label, controller in entries:
         episodes = [
-            _record_rollout(env, controller, scenario_baseline, seed=s, n_steps=n_steps)
+            _record_rollout(env, controller, scenario_baseline, seed=s, n_steps=n_steps,
+                            constraint_spec=constraint_spec)
             for s in range(n_seeds)
         ]
         data = _stack_episodes(episodes)
@@ -249,7 +265,11 @@ def run_rollouts(
         np.savez(npz_path, meta=np.array(json.dumps(meta)), **data)
 
         mean_total = float(np.mean(data["rewards"].sum(axis=1)))
-        print(f"  {label:<28}  mean total reward = {mean_total:9.1f}   -> {slug}.npz")
+        viol_note = ""
+        if constraint_spec:
+            vo = constraint_metrics(data["violations"], constraint_spec)["overall"]
+            viol_note = f"  |  viol {vo['rate']*100:4.1f}% ({vo['count']})"
+        print(f"  {label:<28}  mean total reward = {mean_total:9.1f}{viol_note}   -> {slug}.npz")
         methods_meta.append({"slug": slug, "label": label, "file": f"{slug}.npz"})
 
     # Manifest: everything the plotting utility needs to interpret the .npz files.
@@ -262,6 +282,7 @@ def run_rollouts(
         "dt":          cfg["env_params"]["tsim"] / cfg["env_params"]["N"],
         "plot_config": cfg["plot_config"],
         "setpoints":   {k: list(map(float, v)) for k, v in cfg["env_params"]["SP"].items()},
+        "constraints": constraint_spec,
         "methods":     methods_meta,
         "array_schema": {
             "states":           "[N, T, n_physical_states]  env.state each step (physical)",
@@ -271,6 +292,7 @@ def run_rollouts(
             "actions_baseline": "[N, T, action_dim]         PID baseline action",
             "rewards":          "[N, T]                     per-step reward",
             "takeover":         "[N, T]                     1=agent, 0=baseline, NaN=N/A",
+            "violations":       "[N, T, n_con]              per-constraint violation magnitude (>=0; 0 if ok)",
         },
     }
     with open(os.path.join(save_dir, "manifest.json"), "w", encoding="utf-8") as f:
