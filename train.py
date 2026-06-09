@@ -31,12 +31,14 @@ Usage
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
+from constraints import violation_magnitudes
 from evaluate import run_episode, evaluate
 from models import StandardModels, get_shadow_model, get_standard_model, SwitchingMode, TD3SwitchCritic
 from scenarios import SCENARIOS, make_env_for
@@ -172,6 +174,7 @@ def train_model(
     """
     cfg       = SCENARIOS[scenario]
     n_steps   = cfg["n_steps"]
+    constraint_spec = cfg.get("constraint_spec", [])
     save_path = os.path.join(output_dir, scenario, run_label)
     if per_seed_dir:
         save_path = os.path.join(save_path, f"seed{seed}")
@@ -185,9 +188,15 @@ def train_model(
     best_reward    = -np.inf
     recent_rewards: list[float] = []
     next_eval      = eval_freq
-    train_tk_log: list[tuple[int, float]] = []   # (step, per-episode behaviour takeover %)
-    eval_tk_log:  list[tuple[int, float]] = []   # (step, deployment greedy takeover %)
     last_eval_tk: float | None = None
+
+    # Behaviour-time log: one row PER TRAINING EPISODE for the policy that actually
+    # ran on the "plant" (incl. exploration + warmup) — the basis for the C1
+    # safety-during-training claim. Parallel arrays keyed by cumulative env step.
+    beh = {"steps": [], "return": [], "viol_count": [], "viol_rate": [],
+           "viol_max": [], "takeover": []}
+    # Deployment log: one row per deterministic eval boundary (greedy, no explore).
+    evl = {"steps": [], "return": [], "takeover": []}
 
     bar = tqdm(total=total_steps, unit="step", dynamic_ncols=True, desc=run_label)
 
@@ -195,11 +204,22 @@ def train_model(
         ep_seed      = episode + seed * 10_000
         steps_before = agent.total_steps
 
-        reward, flags = run_episode(env, agent, baseline,
-                                    training=True, seed=ep_seed, n_steps=n_steps)
+        reward, flags, beh_states = run_episode(
+            env, agent, baseline, training=True, seed=ep_seed,
+            n_steps=n_steps, collect_states=True)
         recent_rewards.append(reward)
-        train_tk_log.append((agent.total_steps, float(np.mean(flags)) * 100.0))
         bar.update(agent.total_steps - steps_before)
+
+        # Behaviour-time constraint violations on the trajectory that just ran
+        # (physical env.state vs the scenario's constraint_spec; zero if none).
+        bv = violation_magnitudes(beh_states, constraint_spec)
+        any_v = (bv > 0).any(axis=-1) if bv.shape[-1] else np.zeros(bv.shape[0], dtype=bool)
+        beh["steps"].append(int(agent.total_steps))
+        beh["return"].append(float(reward))
+        beh["viol_count"].append(int(any_v.sum()))
+        beh["viol_rate"].append(float(any_v.mean()) if any_v.size else 0.0)
+        beh["viol_max"].append(float(bv.max()) if bv.size else 0.0)
+        beh["takeover"].append(float(np.mean(flags)) * 100.0)
 
         # Periodic evaluation - loop so no boundary is skipped
         while agent.total_steps >= next_eval:
@@ -213,16 +233,23 @@ def train_model(
                 e_takeovers.append(float(np.mean(eflags)))
             eval_r  = float(np.mean(e_rewards))
             eval_tk = float(np.mean(e_takeovers)) * 100.0
-            eval_tk_log.append((agent.total_steps, eval_tk))
+            evl["steps"].append(int(agent.total_steps))
+            evl["return"].append(eval_r)
+            evl["takeover"].append(eval_tk)
             last_eval_tk = eval_tk
             if eval_r > best_reward:
                 best_reward = eval_r
                 agent.save(os.path.join(save_path, "best.pt"))
                 tqdm.write(f"  [Save] step {agent.total_steps:,} - new best eval: {best_reward:.1f}")
+            # Persist the behaviour-time log incrementally so a killed run keeps data.
+            _save_training_log(save_path, scenario, run_label, seed, agent.warmup_steps,
+                               total_steps, constraint_spec, beh, evl)
             if is_shadow:
                 tqdm.write(f"  [Eval] step {agent.total_steps:,} | reward {eval_r:.1f} | "
                            f"deploy takeover {eval_tk:.1f}%")
-                _plot_takeover(train_tk_log, eval_tk_log, agent.warmup_steps, save_path, run_label)
+                _plot_takeover(list(zip(beh["steps"], beh["takeover"])),
+                               list(zip(evl["steps"], evl["takeover"])),
+                               agent.warmup_steps, save_path, run_label)
 
         recent = float(np.mean(recent_rewards[-50:])) if recent_rewards else 0.0
         postfix: dict[str, str] = {"reward": f"{reward:.0f}", "avg50": f"{recent:.0f}"}
@@ -245,15 +272,21 @@ def train_model(
 
     bar.close()
 
-    # Shadow runs: emit the takeover graph (training behaviour + deployment) + raw log.
+    # Final behaviour-time log (returns + violations + takeover over steps) for
+    # EVERY run — this is the C1/C2/C3 training-curve data the analysis utility reads.
+    log_path = _save_training_log(save_path, scenario, run_label, seed, agent.warmup_steps,
+                                  total_steps, constraint_spec, beh, evl)
+    tqdm.write(f"  Training log: {log_path}")
+
+    # Shadow runs: also emit the takeover graph (training behaviour + deployment).
     if is_shadow:
-        tk_png = _plot_takeover(train_tk_log, eval_tk_log, agent.warmup_steps, save_path, run_label)
-        ts, tv = (zip(*train_tk_log) if train_tk_log else ((), ()))
-        es, ev = (zip(*eval_tk_log)  if eval_tk_log  else ((), ()))
+        tk_png = _plot_takeover(list(zip(beh["steps"], beh["takeover"])),
+                                list(zip(evl["steps"], evl["takeover"])),
+                                agent.warmup_steps, save_path, run_label)
         np.savez(
             os.path.join(save_path, "takeover.npz"),
-            train_steps=np.array(ts), train_takeover=np.array(tv),
-            eval_steps=np.array(es),  eval_takeover=np.array(ev),
+            train_steps=np.array(beh["steps"]), train_takeover=np.array(beh["takeover"]),
+            eval_steps=np.array(evl["steps"]),  eval_takeover=np.array(evl["takeover"]),
         )
         if tk_png:
             tqdm.write(f"  Takeover graph: {tk_png}")
@@ -261,6 +294,51 @@ def train_model(
     tqdm.write(f"\n  Training complete.  Best eval reward: {best_reward:.1f}")
     tqdm.write(f"  Saved: {os.path.join(save_path, 'best.pt')}")
     return agent
+
+
+def _save_training_log(save_path, scenario, run_label, seed, warmup, total_steps,
+                       constraint_spec, beh, evl):
+    """
+    Serialise the behaviour-time training log to training_log.npz (written for
+    every run, standard or shadow). Two parallel-array groups keyed by cumulative
+    env step:
+      behaviour (per training episode — the policy that ran on the plant):
+        beh_steps, beh_return, beh_viol_count, beh_viol_rate, beh_viol_max, beh_takeover
+      deployment (per deterministic eval boundary, greedy):
+        eval_steps, eval_return, eval_takeover
+    A JSON `meta` field records scenario/run/seed, warmup + total steps, and the
+    constraint spec so the analysis utility can interpret the violation columns.
+    Returns the .npz path.
+    """
+    meta = {
+        "scenario": scenario, "run_label": run_label, "seed": int(seed),
+        "warmup_steps": int(warmup), "total_steps": int(total_steps),
+        "n_con": len(constraint_spec),
+        "constraints": [{k: c[k] for k in ("name", "label", "bound", "type", "unit")
+                         if k in c} for c in constraint_spec],
+        "schema": {
+            "beh_steps": "cumulative env steps at training-episode end",
+            "beh_return": "behaviour episode return (incl. exploration + warmup)",
+            "beh_viol_count": "# steps with any constraint violation (behaviour)",
+            "beh_viol_rate": "fraction of episode steps violated (behaviour)",
+            "beh_viol_max": "max per-step violation magnitude (behaviour)",
+            "beh_takeover": "agent takeover % over the episode (100 for standard)",
+            "eval_steps": "cumulative env steps at eval boundary",
+            "eval_return": "mean deterministic (greedy) eval return",
+            "eval_takeover": "deployment takeover % (greedy)",
+        },
+    }
+    path = os.path.join(save_path, "training_log.npz")
+    np.savez(
+        path,
+        meta=np.array(json.dumps(meta)),
+        beh_steps=np.array(beh["steps"]),       beh_return=np.array(beh["return"]),
+        beh_viol_count=np.array(beh["viol_count"]), beh_viol_rate=np.array(beh["viol_rate"]),
+        beh_viol_max=np.array(beh["viol_max"]), beh_takeover=np.array(beh["takeover"]),
+        eval_steps=np.array(evl["steps"]),      eval_return=np.array(evl["return"]),
+        eval_takeover=np.array(evl["takeover"]),
+    )
+    return path
 
 
 def _plot_takeover(train_log, eval_log, warmup, save_path, run_label):

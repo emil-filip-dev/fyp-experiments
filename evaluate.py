@@ -51,7 +51,7 @@ from util import resolve_device
 # ---------------------------------------------------------------------------
 
 def run_episode(env, agent, baseline, training: bool,
-                seed: int, n_steps: int) -> tuple[float, list[bool]]:
+                seed: int, n_steps: int, collect_states: bool = False):
     """
     Run one full episode. Compatible with any scenario and any ShadowDDPG-like
     instance (Pure* / Shadow* / SB3 adapters).
@@ -60,6 +60,10 @@ def run_episode(env, agent, baseline, training: bool,
     -------
     total_reward : float
     agent_flags  : list[bool] — True at each step the agent was in control
+    states       : np.ndarray [T, state_dim] of physical env.state per step —
+                   ONLY when collect_states=True (appended as a third element).
+                   Used by the training loop to measure behaviour-time constraint
+                   violations (the trajectory that actually ran on the "plant").
     """
     obs, _ = env.reset(seed=seed)
     baseline.reset()
@@ -71,6 +75,7 @@ def run_episode(env, agent, baseline, training: bool,
 
     total_reward = 0.0
     agent_flags: list[bool] = []
+    states: list = []
     transitions: list = []
     done = False
     step = 0
@@ -87,6 +92,8 @@ def run_episode(env, agent, baseline, training: bool,
         done = terminated or truncated
 
         agent_flags.append(used_agent)
+        if collect_states:
+            states.append(env.state.copy().astype(np.float32))
         transitions.append((obs, a_exec, reward, next_obs, done, a_agent, a_baseline))
         total_reward += reward
         obs   = next_obs
@@ -101,6 +108,8 @@ def run_episode(env, agent, baseline, training: bool,
             for _ in transitions:
                 agent.update()
 
+    if collect_states:
+        return total_reward, agent_flags, np.asarray(states, dtype=np.float32)
     return total_reward, agent_flags
 
 
@@ -143,7 +152,7 @@ def _record_rollout(env, controller, scenario_baseline, seed: int,
 
     states, observations = [], []
     a_exec_l, a_agent_l, a_base_l = [], [], []
-    rewards, takeover = [], []
+    rewards, takeover, q_gap = [], [], []
     done, step = False, 0
 
     while not done and step < n_steps:
@@ -165,6 +174,10 @@ def _record_rollout(env, controller, scenario_baseline, seed: int,
             a_agent = a_exec.copy()
             tk = float("nan")          # takeover not applicable
 
+        # Takeover advantage signal: Q(s,a_agent) - Q(s,a_baseline) under the
+        # switching critic (q-value shadow only; NaN for agent-mode / non-RL).
+        qg = controller.q_gap(obs, a_baseline) if hasattr(controller, "q_gap") else float("nan")
+
         observations.append(np.asarray(obs, dtype=np.float32))
         obs, reward, terminated, truncated, _ = env.step(a_exec)
         done = terminated or truncated
@@ -175,6 +188,7 @@ def _record_rollout(env, controller, scenario_baseline, seed: int,
         a_base_l.append(a_baseline)
         rewards.append(float(reward))
         takeover.append(tk)
+        q_gap.append(np.float32(qg))
         step += 1
 
     states_arr = np.asarray(states, dtype=np.float32)
@@ -190,6 +204,7 @@ def _record_rollout(env, controller, scenario_baseline, seed: int,
         "actions_baseline": np.asarray(a_base_l,      dtype=np.float32),
         "rewards":          np.asarray(rewards,       dtype=np.float32),
         "takeover":         np.asarray(takeover,      dtype=np.float32),
+        "q_gap":            np.asarray(q_gap,         dtype=np.float32),
         "violations":       violations,
     }
 
@@ -292,6 +307,7 @@ def run_rollouts(
             "actions_baseline": "[N, T, action_dim]         PID baseline action",
             "rewards":          "[N, T]                     per-step reward",
             "takeover":         "[N, T]                     1=agent, 0=baseline, NaN=N/A",
+            "q_gap":            "[N, T]                     Q(s,a_agent)-Q(s,a_baseline) under switching critic (q-value shadow only; NaN otherwise)",
             "violations":       "[N, T, n_con]              per-constraint violation magnitude (>=0; 0 if ok)",
         },
     }

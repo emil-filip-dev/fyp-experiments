@@ -183,19 +183,19 @@ Aim to be able to write, with statistics behind every clause:
 
 | Component | Status | Work needed |
 |-----------|--------|-------------|
-| Scenarios / 4 PC-Gym envs (`scenarios.py`) | ✅ Ready | Add `constraints` / `cons_type` / `done_on_cons_vio` blocks. |
-| Models: Pure/Shadow DDPG·TD3, qvalue + agent, reg, switch-critic (`models.py`) | ✅ Ready & paper-faithful (after recent fixes) | None for core experiments. |
-| NMPC oracle (`models.NMPCController`) | ✅ Ready | None (note: setpoint-tracking only, no disturbances/delta-u). |
+| Scenarios / 4 PC-Gym envs (`scenarios.py`) | ✅ Ready | Constraints DONE — native `constraints`/`cons_type`/`done_on_cons_vio`/`r_penalty` + mirrored `constraint_spec` on all four (cstr verbatim; four_tank/multistage/cryst physically-motivated, see `constraints_rationale.md`). |
+| Models: Pure/Shadow DDPG·TD3, qvalue + agent, reg, switch-critic (`models.py`) | ✅ Ready & paper-faithful (after recent fixes) | None for core experiments. `q_gap()` added for takeover-vs-advantage (C3). |
+| NMPC oracle (`models.NMPCController`) | ✅ Ready | None (setpoint-tracking only). NOTE: it's a *performance* ceiling, NOT a safety oracle — nominal MPC rides the constraint boundary so it violates under noise (see Phase-2 finding). |
 | Save / load + run-label dirs | ✅ Ready | None. |
-| Training loop (`train.py`) | 🟡 Partial | Trains one seed; saves best via deterministic eval. **No behaviour-time logging** (violations / behaviour return over steps). Re-add a lightweight logger. |
-| Rollout recorder (`evaluate.run_rollouts`) | 🟡 Partial | Writes `<method>.npz` + `manifest.json`. **Does not capture `info["cons_info"]`** — add a `violations` array. |
-| Multi-seed / multi-condition orchestration | ❌ Missing | `train.py` is single-run. Add a small runner that loops conditions × seeds × envs. |
+| Training loop (`train.py`) | ✅ Ready | Behaviour-time logger DONE — `training_log.npz` per run (behaviour return + violation count/rate/max + takeover per episode; deterministic eval return + takeover per boundary). |
+| Rollout recorder (`evaluate.run_rollouts`) | ✅ Ready | Per-step `violations` array DONE (computed from `env.state` vs `constraint_spec`, in every `.npz` + manifest). `q_gap` recorded too. |
+| Multi-seed / multi-condition orchestration | ❌ Missing | `train.py` is single-run. Add a runner that loops conditions × seeds × envs (Phase 3). The config layer (`experiments.py`) + `per_seed_dir` support already exist. |
 | Metrics / analysis utility | ❌ Missing | Biggest build. Consume rollouts + training logs → control metrics (IAE/ISE, overshoot, settling, offset), safety metrics, takeover analysis, optimality gap, learning curves. |
-| Robust statistics (`rliable`) | ❌ Missing | `pip install rliable`; wire IQM + bootstrap CIs + probability-of-improvement. |
+| Robust statistics (`rliable`) | 🟡 Installed | `rliable` installed in `.venv`; still to wire IQM + bootstrap CIs + probability-of-improvement into the analysis utility. |
 
-**Summary:** the *learning* machinery is done and paper-faithful. The gaps are all on the
-**measurement** side — constraints, behaviour-time logging, an analysis/metrics utility,
-and orchestration. None are large individually; the analysis utility is the main build.
+**Summary:** the *learning* machinery AND the *capture* machinery (constraints, behaviour-time
+logging, rollout violations) are done. Remaining gaps are **orchestration** (Phase 3) and the
+**analysis/metrics utility** (Phase 4, the main build).
 
 ---
 
@@ -205,28 +205,31 @@ Scoped to be completable **by tomorrow with Claude's help**. Ordered so that if 
 of time, the headline claim (C1 + C2) is still covered. `[core]` = required for the headline
 result; `[stretch]` = strengthens the thesis if time allows.
 
-### Phase 0 — Setup (≈15 min)
-- [ ] `[core]` `pip install rliable` into `.venv`; confirm import.
-- [ ] `[core]` Fix the experiment grid for the first pass: envs = {`cstr`, `four_tank`},
+### Phase 0 — Setup (≈15 min)  ✅ DONE
+- [x] `[core]` `pip install rliable` into `.venv`; confirm import. (installed)
+- [x] `[core]` Fix the experiment grid for the first pass: envs = {`cstr`, `four_tank`},
       conditions = {PID, NMPC oracle, Pure DDPG, Shadow DDPG qvalue}, seeds = 5 (scale to
       10+ later), budget = 50k steps (CSTR) for a complete pipeline run, then scale.
-- [ ] `[core]` Create `experiments/` config (envs, conditions, seeds, steps) so runs are reproducible.
+- [x] `[core]` Create config (envs, conditions, seeds, steps) so runs are reproducible.
+      (`experiments.py` — declarative grids + provenance.)
 
-### Phase 1 — Constraints (≈30 min, `scenarios.py`)
-- [ ] `[core]` Add `constraints`, `cons_type`, `done_on_cons_vio=False` to `cstr` (e.g. cap
-      reactor temperature `T` and/or bound `Ca`) and `four_tank` (tank-level limits).
-- [ ] `[core]` Verify `env.step` populates `info["cons_info"]` and that the NMPC oracle still
-      builds (it already reads `env_params["constraints"]`).
-- [ ] `[stretch]` Add constraints to `crystallization` and `multistage_extraction`.
+### Phase 1 — Constraints (`scenarios.py`)  ✅ DONE
+- [x] `[core]` Add `constraints`, `cons_type`, `done_on_cons_vio=False` to `cstr` (reactor
+      temperature 321–327 K, VERBATIM from PC-Gym) and `four_tank` (h3/h4 overflow ≤ 0.6 m).
+- [x] `[core]` Verify `env.step` populates `info["cons_info"]` and that the NMPC oracle still
+      builds (it reads `env_params["constraints"]`). Verified.
+- [x] `[stretch]` Add constraints to `crystallization` (Conc ≥ 0.11) and `multistage_extraction`
+      (X5 ≤ 0.5). All four physically justified in `constraints_rationale.md`.
 
-### Phase 2 — Capture safety + behaviour-time metrics (≈1.5 h, `evaluate.py` + `train.py`)
-- [ ] `[core]` Extend `_record_rollout` / `run_rollouts` to record a per-step `violations`
-      array (from `info["cons_info"]`) into each `<method>.npz`; document it in the manifest
-      `array_schema`.
-- [ ] `[core]` Add a lightweight **behaviour-time logger** to the training loop: every
-      `eval_freq`, append (step, behaviour return, behaviour violation count/magnitude,
-      takeover fraction, deterministic eval return) to a `training_log.npz` per run.
-- [ ] `[stretch]` Record `Q(agent) − Q(baseline)` per step in rollouts for the takeover-vs-advantage analysis.
+### Phase 2 — Capture safety + behaviour-time metrics (`evaluate.py` + `train.py`)  ✅ DONE
+- [x] `[core]` Record a per-step `violations` array into each `<method>.npz` (computed from
+      `env.state` vs `constraint_spec` — cleaner than PC-Gym's `cons_info`, which leaks across
+      episodes); documented in the manifest `array_schema`.
+- [x] `[core]` Behaviour-time logger in the training loop → `training_log.npz` per run
+      (behaviour return + violation count/rate/max + takeover per episode; deterministic eval
+      return + takeover per boundary; JSON meta with the constraint spec). Written for EVERY run.
+- [x] `[stretch]` Record `Q(agent) − Q(baseline)` per rollout step (`q_gap`) for the
+      takeover-vs-advantage analysis (C3). Verified: +adv when agent acts, −adv when it defers.
 
 ### Phase 3 — Orchestration (≈30 min, new `run_experiments.py`)
 - [ ] `[core]` Script that loops conditions × seeds × envs, calling the existing `train()` and

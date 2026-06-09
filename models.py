@@ -335,6 +335,31 @@ class _ShadowModel(abc.ABC):
             self.baseline_count += 1
             return baseline_action, False, a_agent
 
+    def q_gap(self, obs: np.ndarray, baseline_action: np.ndarray) -> float:
+        """
+        Q(s, a_agent_greedy) - Q(s, a_baseline) under the switching critic, for the
+        DETERMINISTIC agent action. This is exactly the q-value takeover signal
+        (Eq. 6): > 0 means the critic rates the agent's action above the baseline's.
+        Recorded per rollout step for the takeover-vs-advantage analysis (C3).
+
+        Returns NaN for agent-mode switching (the decision there is a learned
+        probability, and the critic operates on the augmented action), where a
+        plain Q(a_agent) - Q(a_baseline) is not the switching criterion.
+        """
+        if self.mode is not SwitchingMode.Q_VALUE:
+            return float("nan")
+        state   = torch.FloatTensor(np.asarray(obs, dtype=np.float32)).unsqueeze(0).to(self.device)
+        action_det, _ = self._get_agent_action(obs)
+        a_agent = torch.FloatTensor(np.asarray(action_det, dtype=np.float32)).unsqueeze(0).to(self.device)
+        a_base  = torch.FloatTensor(np.asarray(baseline_action, dtype=np.float32)).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return float(self._switch_q(state, a_agent).item() - self._switch_q(state, a_base).item())
+
+    @abstractmethod
+    def _switch_q(self, state, action):
+        """The scalar critic estimate used by q-value switching (subclass-specific)."""
+        ...
+
     @abstractmethod
     def _decide_qvalue(self, state, action_agent, action_baseline) -> bool:
         ...
@@ -443,6 +468,9 @@ class ShadowDDPG(_ShadowModel):
             case SwitchingMode.Q_VALUE: mode_label = " (Q Value)"
             case _: mode_label = ""
         return f"Shadow DDPG{mode_label}"
+
+    def _switch_q(self, state, action):
+        return self.critic(state, action)
 
     def _decide_qvalue(self, state, action_agent, action_baseline) -> bool:
         # Eq. (6): take over when the single online critic rates the agent's
@@ -627,13 +655,17 @@ class ShadowTD3(_ShadowModel):
             case _: mode_label = ""
         return f"Shadow TD3{mode_label}"
 
+    def _switch_q(self, state, action):
+        match self.switch_critic:
+            case TD3SwitchCritic.Q_MIN: q = self.critic.q_min
+            case _:                     q = self.critic.q1_only
+        return q(state, action)
+
     def _decide_qvalue(self, state, action_agent, action_baseline) -> bool:
         # Eq. (6): take over when the chosen twin-critic estimate rates the
         # agent's action above the baseline's. q1 is consistent with the actor's
         # objective; qmin is the conservative min(Q1, Q2).
-        match self.switch_critic:
-            case TD3SwitchCritic.Q_MIN: q = self.critic.q_min
-            case _:                     q = self.critic.q1_only
+        q = self._switch_q
         with torch.no_grad():
             q_agent    = q(state, action_agent).item()
             q_baseline = q(state, action_baseline).item()

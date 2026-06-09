@@ -19,10 +19,24 @@ by this project's training/eval pipeline and shadow mode:
   state_dim, action_dim, n_steps, baseline_cls (a PID/PI safety-net controller
   that drives the SAME variable PC-Gym controls), plot_config.
 
-NOTE: constraints (Phase-1 safety layer) were calibrated for the OLD operating
-points and are NOT re-added here — the verbatim PC-Gym operating points differ, so
-they need fresh calibration. `constraint_spec` is intentionally absent (the eval
-pipeline treats its absence as "no constraints").
+NOTE: constraints (Phase-1 safety layer). All four are added as PC-Gym-NATIVE
+env_params (constraints/cons_type/done_on_cons_vio=False/r_penalty=False) so the
+env records info["cons_info"] and, for setpoint-tracking scenarios, the do-mpc
+oracle (models.NMPCController) enforces them as hard state bounds. Each is ALSO
+mirrored in `constraint_spec` for the eval pipeline's own env.state-based
+violation detection (constraints.py / evaluate.py).
+  cstr      : reactor temperature 321 K <= T <= 327 K. VERBATIM from PC-Gym
+              (pc-gym_paper/constraint_showcase: cons={'T':[327,321]},
+              cons_type={'T':['<=','>=']}). Oracle-enforced.
+  four_tank : lower-tank overflow h3 <= 0.6 m, h4 <= 0.6 m. OURS (PC-Gym defines
+              none) — the physical tank height (o_space high). Oracle-enforced.
+  multistage_extraction : product off-spec X5 <= 0.5 mol/L. OURS. Oracle-enforced.
+  crystallization : minimum liquor concentration Conc >= 0.11 kg/kg. OURS. Oracle
+              N/A (delta-u action -> NMPCController/run_rollouts skip the oracle);
+              constraint still recorded by the env and detected from env.state.
+The three OURS bounds are calibrated against the measured operating envelope so
+nominal (PID/PI baseline) control stays inside while aggressive/exploratory
+control crosses them — the regime the C1 safety-during-training claim needs.
 
 make_env_for(scenario) -> gym.Env
 """
@@ -251,6 +265,17 @@ def _cstr_config():
         'high': np.array([1, 350, 0.9]),
     }
     r_scale = {'Ca': 1e3}
+    # Constraint copied VERBATIM from pc-gym_paper/constraint_showcase
+    # (constraint_paper.py / custom_reward.py / constraint_violation_vis.py):
+    #   cons = {'T': [327, 321]},  cons_type = {'T': ['<=', '>=']}
+    # i.e. reactor temperature bounded 321 K <= T <= 327 K. Passed as PC-Gym-native
+    # env_params so (a) the env populates info["cons_info"], and (b) PC-Gym's do-mpc
+    # oracle (models.NMPCController) reads it and imposes T as hard MPC state bounds.
+    # The showcase's flag values are used verbatim: done_on_cons_vio=False (record,
+    # don't terminate), r_penalty=False (reward unchanged — the OCP custom_reward
+    # ignores the constraint flag anyway).
+    cons = {'T': [327, 321]}
+    cons_type = {'T': ['<=', '>=']}
     env_params = {
         'N': nsteps,
         'tsim': T,
@@ -266,6 +291,10 @@ def _cstr_config():
         'integration_method': 'casadi',
         'noise_percentage': 0.001,
         'custom_reward': sp_track_reward,
+        'constraints': cons,
+        'cons_type': cons_type,
+        'done_on_cons_vio': False,
+        'r_penalty': False,
     }
     return {
         "env_params":   env_params,
@@ -275,6 +304,17 @@ def _cstr_config():
         "baseline_cls": CSTRBaseline,
         "plot_config": [
             {"state_idx": 0, "sp_idx": 2, "label": "Ca", "unit": "mol/L"},
+        ],
+        # Constraint copied VERBATIM from pc-gym_paper/constraint_showcase
+        # (constraint_paper.py / custom_reward.py / constraint_violation_vis.py):
+        #   cons = {'T': [327, 321]},  cons_type = {'T': ['<=', '>=']}
+        # i.e. reactor temperature bounded 321 K <= T <= 327 K. State order for the
+        # cstr model is [Ca, T, Ca_SP], so T is physical-state index 1.
+        "constraint_spec": [
+            {"name": "T_max", "label": "Reactor temperature (upper)",
+             "state_idx": 1, "bound": 327, "type": "<=", "unit": "K"},
+            {"name": "T_min", "label": "Reactor temperature (lower)",
+             "state_idx": 1, "bound": 321, "type": ">=", "unit": "K"},
         ],
     }
 
@@ -295,6 +335,16 @@ def _four_tank_config():
         'low': np.array([0, ] * 6),
         'high': np.array([0.6] * 6),
     }
+    # Constraint OURS (not verbatim PC-Gym — PC-Gym defines no four_tank constraint).
+    # Physically motivated: the two controlled lower tanks must not OVERFLOW their
+    # physical height (o_space high = 0.6 m). Calibrated against the measured
+    # operating envelope: the PID baseline peaks at h3=0.589/h4=0.337 (safe), while
+    # sustained max-pump actions drive h3 to 0.733 (overflow) -> the bound is
+    # respected by nominal control and crossed only by aggressive/exploratory
+    # control, which is exactly what the C1 safety-during-training claim needs.
+    # Passed PC-Gym-native so the do-mpc oracle enforces h3,h4 as hard state bounds.
+    cons = {'h3': [0.6], 'h4': [0.6]}
+    cons_type = {'h3': ['<='], 'h4': ['<=']}
     env_params = {
         'N': nsteps,
         'tsim': T,
@@ -309,6 +359,10 @@ def _four_tank_config():
         'noise_percentage': 0.05,
         'custom_reward': sp_track_reward,
         'integration_method': 'casadi',
+        'constraints': cons,
+        'cons_type': cons_type,
+        'done_on_cons_vio': False,
+        'r_penalty': False,
     }
     return {
         "env_params":   env_params,
@@ -319,6 +373,14 @@ def _four_tank_config():
         "plot_config": [
             {"state_idx": 2, "sp_idx": 4, "label": "h3", "unit": "m"},
             {"state_idx": 3, "sp_idx": 5, "label": "h4", "unit": "m"},
+        ],
+        # Mirrors the native env_params constraints above for the eval pipeline's
+        # env.state-based detection. State order [h1,h2,h3,h4,h3_sp,h4_sp] -> h3=2, h4=3.
+        "constraint_spec": [
+            {"name": "h3_max", "label": "Tank 3 level (overflow)",
+             "state_idx": 2, "bound": 0.6, "type": "<=", "unit": "m"},
+            {"name": "h4_max", "label": "Tank 4 level (overflow)",
+             "state_idx": 3, "bound": 0.6, "type": "<=", "unit": "m"},
         ],
     }
 
@@ -341,6 +403,15 @@ def _multistage_extraction_config():
     r_scale = {
         'X5': 1,
     }
+    # Constraint OURS (not verbatim PC-Gym — PC-Gym defines no multistage constraint).
+    # Physically motivated: the controlled product stream solute fraction X5 must not
+    # exceed an off-spec ceiling of 0.5 mol/L (the setpoints are 0.3/0.4, well below).
+    # Calibrated against the measured envelope: the PI baseline peaks at X5=0.474
+    # (safe) while sustained extreme flows push X5 to 0.585 (off-spec) -> respected by
+    # nominal control, crossed by aggressive/exploratory control. Passed PC-Gym-native
+    # so the do-mpc oracle enforces X5 as a hard upper state bound.
+    cons = {'X5': [0.5]}
+    cons_type = {'X5': ['<=']}
     env_params = {
         'N': nsteps,
         'tsim': T,
@@ -357,6 +428,10 @@ def _multistage_extraction_config():
         'noise_percentage': 0.05,
         'integration_method': 'casadi',
         'custom_reward': sp_track_reward,
+        'constraints': cons,
+        'cons_type': cons_type,
+        'done_on_cons_vio': False,
+        'r_penalty': False,
     }
     return {
         "env_params":   env_params,
@@ -366,6 +441,12 @@ def _multistage_extraction_config():
         "baseline_cls": MultistageExtractionBaseline,
         "plot_config": [
             {"state_idx": 8, "sp_idx": 10, "label": "X5", "unit": "mol/L"},
+        ],
+        # Mirrors the native env_params constraint above for env.state-based detection.
+        # State order [X1,Y1,X2,Y2,X3,Y3,X4,Y4,X5,Y5,X5_sp] -> X5 = index 8.
+        "constraint_spec": [
+            {"name": "X5_max", "label": "Product solute fraction (off-spec)",
+             "state_idx": 8, "bound": 0.5, "type": "<=", "unit": "mol/L"},
         ],
     }
 
@@ -402,6 +483,19 @@ def _crystallization_config():
     }
     CV_0 = np.sqrt(1800863.24079725 * 1478.00986666666 / (22995.8230590611 ** 2) - 1)
     Ln_0 = 22995.8230590611 / (1478.00986666666 + 1e-6)
+    # Constraint OURS (not verbatim PC-Gym — PC-Gym defines no crystallization
+    # constraint). Physically motivated: maintain a MINIMUM solute concentration,
+    # Conc >= 0.11 (the model's scaled concentration state c; o_space [0, 0.5]) —
+    # aggressive over-cooling crashes the supersaturation S = c*1e3 - C_eq and
+    # over-depletes the solution (toward dissolution / loss of driving force).
+    # Calibrated against the measured envelope: the P baseline holds Conc >= 0.125
+    # (x0 starts at 0.1586) while sustained extreme cooling drives Conc down to 0.103
+    # (over-depleted) -> respected by nominal control, crossed by aggressive/
+    # exploratory control. Native env_params so the env records info["cons_info"];
+    # note the do-mpc oracle is N/A here (delta-u action, NMPCController/run_rollouts
+    # skip the oracle for crystallization).
+    cons = {'Conc': [0.11]}
+    cons_type = {'Conc': ['>=']}
     env_params = {
         'N': nsteps,
         'tsim': T,
@@ -419,6 +513,10 @@ def _crystallization_config():
         'a_delta': True,
         'a_space_act': action_space_act,
         'custom_reward': cryst_oracle_reward,
+        'constraints': cons,
+        'cons_type': cons_type,
+        'done_on_cons_vio': False,
+        'r_penalty': False,
     }
     return {
         "env_params":   env_params,
@@ -429,6 +527,12 @@ def _crystallization_config():
         "plot_config": [
             {"state_idx": 5, "sp_idx": 7, "label": "CV", "unit": ""},
             {"state_idx": 6, "sp_idx": 8, "label": "Ln", "unit": "um"},
+        ],
+        # Mirrors the native env_params constraint above for env.state-based detection.
+        # State order [Mu0,Mu1,Mu2,Mu3,Conc,CV,Ln,CV_sp,Ln_sp] -> Conc = index 4.
+        "constraint_spec": [
+            {"name": "Conc_min", "label": "Solute concentration (over-depletion)",
+             "state_idx": 4, "bound": 0.11, "type": ">=", "unit": ""},
         ],
     }
 
