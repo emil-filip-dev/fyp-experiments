@@ -839,7 +839,7 @@ class DDPG(ShadowDDPG):
 
     @property
     def label(self) -> str:
-        return f"DDPG"
+        return "DDPG"
 
     def decide_action(self, obs, baseline_action, training: bool = True, force_baseline: bool = False):
         if force_baseline:
@@ -904,7 +904,7 @@ class TD3(ShadowTD3):
 
     @property
     def label(self) -> str:
-        return f"TD3"
+        return "TD3"
 
     def decide_action(self, obs, baseline_action, training: bool = True, force_baseline: bool = False):
         if force_baseline:

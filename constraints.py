@@ -15,14 +15,7 @@ Two jobs:
      report HOW MANY violations occur (count, rate, magnitude, robust per-seed
      dispersion) and WHEN they occur (per-step timeline, median first-violation
      step, transient-vs-steady split).
-
-CLI — summarise the violations recorded in a rollout directory across methods:
-  .venv/Scripts/python constraints.py outputs/rollouts/cstr/<timestamp>
 """
-
-import argparse
-import json
-from pathlib import Path
 
 import numpy as np
 
@@ -132,70 +125,3 @@ def constraint_metrics(violations, spec: list[dict]) -> dict:
     }
 
 
-def format_summary(label: str, metrics: dict) -> str:
-    """One-method human-readable violation summary (counts + timing)."""
-    o = metrics["overall"]
-    lines = [f"{label}"]
-    lines.append(
-        f"  overall : {o['rate']*100:5.1f}% of steps | {o['count']} total | "
-        f"{o['n_seeds_with_violation']}/{metrics['n_seeds']} seeds | "
-        f"median/seed {o['median_count']:.0f} (MAD {o['mad_count']:.0f})"
-    )
-    if o["first_step_median"] is not None:
-        lines.append(
-            f"            when : first ~step {o['first_step_median']:.0f}/{metrics['n_steps']} | "
-            f"first-half {o['frac_first_half']*100:.1f}% vs second-half {o['frac_second_half']*100:.1f}%"
-        )
-    for name, m in metrics["per_constraint"].items():
-        lines.append(
-            f"  - {m['label']:<26} ({name} {m['type']} {m['bound']}{m['unit']}): "
-            f"{m['rate']*100:5.1f}% of steps | {m['count']} | max over {m['max_magnitude']:.3g}{m['unit']}"
-        )
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Rollout-directory loader + CLI
-# ---------------------------------------------------------------------------
-
-def load_rollout_metrics(rollout_dir) -> tuple[list[dict], dict]:
-    """
-    Load a rollout directory (written by evaluate.run_rollouts) and compute
-    per-method constraint metrics. Returns (constraint_spec, {label: metrics}).
-    """
-    rollout_dir = Path(rollout_dir)
-    manifest = json.loads((rollout_dir / "manifest.json").read_text(encoding="utf-8"))
-    spec = manifest.get("constraints", [])
-    results: dict[str, dict] = {}
-    for m in manifest["methods"]:
-        data = np.load(rollout_dir / m["file"])
-        if "violations" not in data.files:
-            continue
-        results[m["label"]] = constraint_metrics(data["violations"], spec)
-    return spec, results
-
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="Summarise constraint violations recorded in a rollout directory."
-    )
-    ap.add_argument("rollout_dir", help="outputs/rollouts/<scenario>/<timestamp>")
-    args = ap.parse_args()
-
-    spec, results = load_rollout_metrics(args.rollout_dir)
-    print(f"\n{'='*64}")
-    print(f"  Constraint violations - {args.rollout_dir}")
-    if spec:
-        print("  Constraints: " + "; ".join(
-            f"{c['name']} ({c.get('label', c['name'])} {c['type']} {c['bound']}{c.get('unit','')})"
-            for c in spec))
-    else:
-        print("  (no constraints defined for this scenario)")
-    print(f"{'='*64}")
-    for label, metrics in results.items():
-        print(format_summary(label, metrics))
-        print()
-
-
-if __name__ == "__main__":
-    main()

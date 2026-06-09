@@ -15,27 +15,21 @@ describing the scenario (timing, plot_config, setpoint schedule, method list).
 Reference controllers always included:
   - PID         — the scenario's baseline controller acting on its own
   - NMPC Oracle — do-mpc + IPOPT nonlinear MPC on the env's exact dynamics
-                  (best-achievable reference; disable with --no-oracle)
+                  (best-achievable reference; disable with use_oracle=False)
 
-Also exports run_episode and evaluate (reused by trainer.py).
-
-Usage
------
-  # Auto-discover all models under outputs/models/<scenario>/ and write rollouts
-  .venv/Scripts/python evaluate.py --scenario cstr --n-seeds 20
-
-  # Specific checkpoints, no oracle
-  .venv/Scripts/python evaluate.py --scenario cstr --no-oracle \\
-      --models outputs/models/cstr/ddpg/best.pt
+Programmatic API (no CLI):
+  - `run_rollouts(scenario, model_specs, ...)` — write the rollouts. `model_specs`
+    is a list of typed `schema.ModelSpec` (checkpoint + RunSpec); method identity
+    flows through `schema.MethodRecord`, never a filename. The orchestrator
+    (run_experiments.py) builds the specs from the grid.
+  - `run_episode(...)` — the shared per-episode runner (also used by train.py).
 
 Output: outputs/rollouts/<scenario>/<timestamp>/  (<method>.npz + manifest.json)
 """
 
-import argparse
 import json
 import os
 from datetime import datetime
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -43,11 +37,11 @@ import torch
 from constraints import constraint_metrics, violation_magnitudes
 from models import NMPCController, ShadowModels, get_shadow_model, get_standard_model
 from scenarios import SCENARIOS, make_env_for
-from util import resolve_device
+from schema import MethodRecord, MethodRole, ModelSpec, RolloutController, Scenario
 
 
 # ---------------------------------------------------------------------------
-# Episode runner + evaluator  (reused by trainer.py)
+# Episode runner  (reused by train.py's training loop)
 # ---------------------------------------------------------------------------
 
 def run_episode(env, agent, baseline, training: bool,
@@ -113,17 +107,8 @@ def run_episode(env, agent, baseline, training: bool,
     return total_reward, agent_flags
 
 
-def evaluate(env, agent, baseline, n_seeds: int, n_steps: int) -> float:
-    """Mean reward over n_seeds deterministic evaluation episodes."""
-    rewards = [
-        run_episode(env, agent, baseline, training=False, seed=s, n_steps=n_steps)[0]
-        for s in range(n_seeds)
-    ]
-    return float(np.mean(rewards))
-
-
 # ---------------------------------------------------------------------------
-# Rollout recorder + writer  (the sole job of this module's CLI)
+# Rollout recorder + writer
 # ---------------------------------------------------------------------------
 
 def _record_rollout(env, controller, scenario_baseline, seed: int,
@@ -217,79 +202,92 @@ def _stack_episodes(episodes: list[dict]) -> dict:
 
 
 def run_rollouts(
-    scenario:    str,
-    model_paths: list[str],
+    scenario:    Scenario | str,
+    model_specs: list[ModelSpec],
     n_seeds:     int  = 10,
     use_oracle:  bool = True,
     mpc_horizon: int  = 20,
     output_dir:  str  = "outputs/rollouts",
-    device:      torch.device = torch.device("cpu")
-):
+    device:      torch.device = torch.device("cpu"),
+) -> str:
     """
-    Run every method (PID, NMPC oracle, and the given/discovered models) on the
+    Run every method (PID, NMPC oracle, and the given trained models) on the
     scenario for `n_seeds` seeds, serialising the raw rollouts to
     output_dir/<scenario>/<timestamp>/ as one .npz per method + manifest.json.
-    No plotting or metric computation — that is the plotting utility's job.
+
+    Method identity is carried by typed schema.MethodRecord objects (role + the
+    model's RunSpec) — serialised into each .npz `meta` and the manifest. Nothing
+    here, or downstream, derives metadata from a filename. No plotting/metrics.
     """
+    scenario = Scenario(scenario)
     cfg     = SCENARIOS[scenario]
     n_steps = cfg["n_steps"]
 
-    # (slug, label, controller). References first.
-    entries: list[tuple[str, str, object]] = [("pid", "PID", cfg["baseline_cls"]())]
+    # (controller, MethodRecord). References first, then the trained models.
+    planned: list[tuple[RolloutController, MethodRecord]] = [
+        (cfg["baseline_cls"](),
+         MethodRecord(role=MethodRole.PID, label="PID", npz_file="pid.npz", scenario=scenario)),
+    ]
     if use_oracle:
         print(f"  Building NMPC oracle (do-mpc + IPOPT, horizon={mpc_horizon})...")
         try:
-            entries.append(("nmpc_oracle", "NMPC Oracle", NMPCController(cfg, horizon=mpc_horizon)))
+            planned.append((
+                NMPCController(cfg, horizon=mpc_horizon),
+                MethodRecord(role=MethodRole.NMPC_ORACLE, label="NMPC Oracle",
+                             npz_file="nmpc_oracle.npz", scenario=scenario),
+            ))
         except NotImplementedError as e:
             # e.g. delta-u scenarios (crystallization) — the oracle can't model them.
             print(f"  [skip oracle] {e}")
 
-    for path in model_paths:
-        slug = Path(path).parent.name
-        ckpt = torch.load(path, weights_only=False, map_location=device)
+    for spec in model_specs:
+        ckpt = torch.load(spec.checkpoint, weights_only=False, map_location=device)
         if isinstance(ckpt["type"], ShadowModels):
             model = get_shadow_model(ckpt["type"]).load(ckpt, device=device)
         else:
             model = get_standard_model(ckpt["type"]).load(ckpt, device=device)
-        entries.append((slug, model.label, model))
+        # Unique, human-readable filename built FROM the run object (object -> name,
+        # never name -> object). Identity lives in `run`.
+        planned.append((model, MethodRecord(
+            role=MethodRole.MODEL, label=model.label, npz_file=f"{spec.run.artifact_stem}.npz",
+            scenario=scenario, run=spec.run)))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir  = os.path.join(output_dir, scenario, timestamp)
+    save_dir  = os.path.join(output_dir, str(scenario), timestamp)
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"\n{'='*62}")
-    print(f"  Scenario : {scenario}   |   methods: {len(entries)}   |   seeds: {n_seeds}")
+    print(f"  Scenario : {scenario}   |   methods: {len(planned)}   |   seeds: {n_seeds}")
     print(f"  Output   : {save_dir}")
     print(f"{'='*62}\n")
 
     env = make_env_for(scenario)
     scenario_baseline = cfg["baseline_cls"]()   # shadow switching + baseline column
     constraint_spec = cfg.get("constraint_spec", [])
-    methods_meta: list[dict] = []
+    method_records: list[MethodRecord] = []
 
-    for slug, label, controller in entries:
+    for controller, record in planned:
         episodes = [
             _record_rollout(env, controller, scenario_baseline, seed=s, n_steps=n_steps,
                             constraint_spec=constraint_spec)
             for s in range(n_seeds)
         ]
         data = _stack_episodes(episodes)
-        meta = {"slug": slug, "label": label, "scenario": scenario,
-                "n_seeds": n_seeds, "seeds": list(range(n_seeds))}
-        npz_path = os.path.join(save_dir, f"{slug}.npz")
-        np.savez(npz_path, meta=np.array(json.dumps(meta)), **data)
+        # Each .npz is self-describing: its own MethodRecord is stored as `meta`.
+        np.savez(os.path.join(save_dir, record.npz_file),
+                 meta=np.array(json.dumps(record.to_json())), **data)
 
         mean_total = float(np.mean(data["rewards"].sum(axis=1)))
         viol_note = ""
         if constraint_spec:
             vo = constraint_metrics(data["violations"], constraint_spec)["overall"]
             viol_note = f"  |  viol {vo['rate']*100:4.1f}% ({vo['count']})"
-        print(f"  {label:<28}  mean total reward = {mean_total:9.1f}{viol_note}   -> {slug}.npz")
-        methods_meta.append({"slug": slug, "label": label, "file": f"{slug}.npz"})
+        print(f"  {record.label:<28}  mean total reward = {mean_total:9.1f}{viol_note}   -> {record.npz_file}")
+        method_records.append(record)
 
-    # Manifest: everything the plotting utility needs to interpret the .npz files.
+    # Manifest: everything the analysis utility needs to interpret the .npz files.
     manifest = {
-        "scenario":    scenario,
+        "scenario":    str(scenario),
         "timestamp":   timestamp,
         "n_seeds":     n_seeds,
         "n_steps":     n_steps,
@@ -298,7 +296,7 @@ def run_rollouts(
         "plot_config": cfg["plot_config"],
         "setpoints":   {k: list(map(float, v)) for k, v in cfg["env_params"]["SP"].items()},
         "constraints": constraint_spec,
-        "methods":     methods_meta,
+        "methods":     [r.to_json() for r in method_records],
         "array_schema": {
             "states":           "[N, T, n_physical_states]  env.state each step (physical)",
             "obs":              "[N, T, obs_dim]            normalised observation",
@@ -316,57 +314,3 @@ def run_rollouts(
 
     print(f"\n  Rollouts + manifest.json written to {save_dir}")
     return save_dir
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Run models on a PC-Gym scenario and serialise per-step rollouts."
-    )
-    parser.add_argument(
-        "--scenario", type=str, default="cstr", choices=list(SCENARIOS.keys()),
-        help="PC-Gym scenario to run on",
-    )
-    parser.add_argument(
-        "--models", type=str, nargs="*", default=[], metavar="PATH",
-        help="Checkpoint paths to run (default: auto-discover under "
-             "outputs/models/<scenario>/)",
-    )
-    parser.add_argument(
-        "--n-seeds", type=int, default=10,
-        help="Number of seeds (episodes) recorded per method (default: 10)",
-    )
-    parser.add_argument(
-        "--no-oracle", action="store_true",
-        help="Skip the NMPC oracle (faster; included by default)",
-    )
-    parser.add_argument(
-        "--mpc-horizon", type=int, default=20,
-        help="NMPC oracle prediction horizon in steps (default: 20)",
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default="outputs/rollouts",
-        help="Root directory for rollout outputs (default: outputs/rollouts/)",
-    )
-    parser.add_argument(
-        "--cpu", action="store_true",
-        help="Force to use the CPU."
-    )
-    args = parser.parse_args()
-
-    run_rollouts(
-        scenario=args.scenario,
-        model_paths=args.models,
-        n_seeds=args.n_seeds,
-        use_oracle=not args.no_oracle,
-        mpc_horizon=args.mpc_horizon,
-        output_dir=args.output_dir,
-        device=resolve_device("cpu" if args.cpu else "gpu"),
-    )
-
-
-if __name__ == "__main__":
-    main()

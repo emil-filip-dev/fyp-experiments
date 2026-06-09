@@ -26,14 +26,15 @@ table + phased TODO. **Read it before doing experiment work.**
 - **Activate venv**: `.venv/Scripts/activate`
 - **Run scripts**: `.venv/Scripts/python <script.py>`
 - **Install packages**: `.venv/Scripts/pip install <pkg>`
-- **OS**: Windows. Default shell is PowerShell; a Bash tool is also available. `util.configure_utf8_output()`
-  is called at the top of each script's `main()` so non-ASCII logs survive stdout redirection on Windows.
+- **OS**: Windows. Default shell is PowerShell; a Bash tool is also available.
+  `util.configure_utf8_output()` exists for non-ASCII stdout on Windows but is no longer
+  auto-invoked (the CLIs were removed — see below); call it yourself in a driver if needed.
 
 ## Dependencies (requirements.txt)
 tqdm, numpy, matplotlib, casadi, jax[cpu], equinox, diffrax, do-mpc[full], pcgym.
 Also required at runtime: **torch** (the entire model core is PyTorch) and **gymnasium**
-(pulled in transitively by pcgym). **Not yet installed but planned** for the analysis utility:
-`rliable` (robust RL statistics — see `dissertation_plan.md` Phase 0/§6).
+(pulled in transitively by pcgym). **`rliable`** (robust RL statistics) is installed in `.venv`
+and to be wired into the analysis utility (Phase 4 — see `dissertation_plan.md` §6).
 
 > History: `stable-baselines3` and `gymnasium` used to be explicit deps for an SB3 backend.
 > The SB3 backend was removed in the "Human refactor" (commit `f386748`, 2026-06-08); the
@@ -56,9 +57,9 @@ env_params = {
     'noise': True,
     'integration_method': 'casadi',
     'noise_percentage': 0.001,
-    # NOT YET USED but supported by PC-Gym (prerequisite for safety metrics):
-    #   'constraints': {...}, 'cons_type': '<=' / '>=', 'done_on_cons_vio': False
-    #   -> per-step absolute violation magnitudes returned in info['cons_info']
+    # NOW USED on all four scenarios (PC-Gym-native constraints, see scenarios.py):
+    #   'constraints': {...}, 'cons_type': '<=' / '>=', 'done_on_cons_vio': False,
+    #   'r_penalty': False  -> per-step magnitudes in info['cons_info']; oracle reads them too.
 }
 
 env = make_env(env_params)
@@ -68,9 +69,16 @@ obs, reward, terminated, truncated, info = env.step(action)
 ```
 
 ## Codebase Architecture
-A small set of shared modules plus thin CLI scripts. Scenarios, models, and the episode
-runner are factored out so `train.py` and `evaluate.py` share the same code paths. The model
-layer is **one custom PyTorch core** — there is no longer a second (SB3) backend.
+A small set of shared **library modules** (no CLIs — invoked programmatically; the argparse
+entry points were removed for simplicity). `schema.py` holds the typed vocabulary (StrEnums +
+dataclasses); scenarios, models, and the episode runner are factored out so training and
+evaluation share the same code paths. The model layer is **one custom PyTorch core** — there
+is no second (SB3) backend.
+
+**Design rules (enforced):** run metadata lives in **typed objects serialised to JSON**
+(`schema.py`: `RunSpec`, `ModelSpec`, `MethodRecord`), never derived from directory slugs;
+categorical values are **StrEnums** (`Scenario`, `Algorithm`, `SwitchingMode`, `TD3SwitchCritic`,
+`MethodRole`, `Device`), not bare strings; type hints everywhere. Slugs only *locate* files.
 
 - `scenarios.py` — central registry (`SCENARIOS` dict) of all four PC-Gym environments.
   **`env_params` are copied VERBATIM from PC-Gym's own paper training scripts**
@@ -93,11 +101,15 @@ layer is **one custom PyTorch core** — there is no longer a second (SB3) backe
   - **Custom rewards** (copied verbatim, used via `env_params["custom_reward"]`): `sp_track_reward`
     (OCP setpoint tracking + R=0.1 Δu penalty) for cstr/four_tank/multistage; `cryst_oracle_reward`
     (CV/Ln tracking + R=0.01 Δu penalty) for crystallization.
-  - **Constraints (Phase-1 safety layer) are currently DROPPED.** `constraint_spec` is absent —
-    the old bounds were calibrated for the old (wrong) operating points; they need fresh
-    calibration against the verbatim operating points before re-adding. The infra
-    (`constraints.py`, the eval-side capture) remains and treats absent `constraint_spec` as
-    "no constraints". Re-calibrating them is a follow-up. See `constraints.py` / `dissertation_plan.md` §3.
+  - **Constraints (Phase-1 safety layer) are ADDED on all four scenarios** — PC-Gym-native
+    (`env_params` `constraints`/`cons_type`/`done_on_cons_vio=False`/`r_penalty=False`) so the
+    env records `info["cons_info"]` and the do-mpc oracle enforces them as hard state bounds;
+    also mirrored in a `constraint_spec` (list of dicts: `state_idx`/`bound`/`type`/`name`/`label`/
+    `unit`) that the eval pipeline uses for its own `env.state`-based detection (see `constraints.py`).
+    `cstr` is **verbatim PC-Gym** (T ∈ [321,327] K, from the constraint_showcase); `four_tank`
+    (h3,h4 ≤ 0.6 m overflow), `multistage` (X5 ≤ 0.5 off-spec), `crystallization` (Conc ≥ 0.11
+    over-depletion) are **OURS**, physically-calibrated so nominal control stays inside while
+    exploration crosses them — full justification in `constraints_rationale.md`.
 
 - `models.py` — all model definitions, one shared core; variants differ only in `decide_action`,
   a clean ablation set.
@@ -105,7 +117,9 @@ layer is **one custom PyTorch core** — there is no longer a second (SB3) backe
     decision_prob∈[0,1])`), `Critic` (single Q, used by ShadowDDPG), `CriticTwin` (twin Q1/Q2
     with `q_min` / `q1_only`, used by ShadowTD3), `ReplayBuffer` (stores executed action +
     agent action + baseline action per transition). Abstract base `_ShadowModel` holds the
-    shared `decide_action` / `store` / `save` / `load` logic.
+    shared `decide_action` / `store` / `save` / `load` logic, plus `q_gap(obs, baseline_action)`
+    → `Q(s, a_agent) − Q(s, a_baseline)` under the switching critic (q-value only; NaN for
+    agent-mode / non-RL) — recorded per rollout step for the takeover-vs-advantage analysis (C3).
   - **Shadow agents** `ShadowDDPG` / `ShadowTD3`. Switching `mode`:
     - `qvalue` (`SwitchingMode.Q_VALUE`) — act if `Q(s, a_agent) > Q(s, a_baseline)` (Eq. 6;
       compares on the deterministic policy action, executes the noised one).
@@ -136,46 +150,61 @@ layer is **one custom PyTorch core** — there is no longer a second (SB3) backe
     `NotImplementedError` on scenarios with disturbances or delta-u. Overrides PC-Gym's buggy
     `p_fun` with a scalar-safe, non-lagging setpoint lookup.
 
-- `util.py` — `configure_utf8_output()`, `resolve_device("cpu"|"gpu")`, `device_label()`.
-  (These were relocated here from the deleted `trainer.py` in the refactor.)
+- `util.py` — `configure_utf8_output()`, `resolve_device("cpu"|"gpu")` (accepts a `Device`
+  StrEnum too, since it's a `str`), `device_label()`.
 
-- `train.py` — **single entry point for standard OR shadow training**, custom core only.
-  `--shadow` flips switching on; standard and shadow share the same core/hyperparameters so they
-  form a clean ablation. The **training loop lives inline here** as `train_model()` (formerly
-  `trainer.py`): episode-based, periodic deterministic eval every `--eval-freq` steps (default
-  1000), saves `best.pt` whenever eval reward improves, plus an `epN.pt` snapshot every
-  `--checkpoint-freq` episodes (default 1000; `0` disables). **No behaviour-time metric logging**
-  (violations / behaviour return / takeover over steps) — that subsystem was removed and is a
-  required re-add for C1/C3/C4 (see `dissertation_plan.md` Phase 2).
-  CLI: `--scenario --model {ddpg,td3} --shadow --mode {qvalue,agent} --steps --seed
-  --lambda-reg --eta-agent --switch-critic {q1,qmin} --eval-freq --checkpoint-freq
-  --output-dir --device {cpu,gpu}`.
-  Run-label (output dir) names: standard → `ddpg` / `td3`; shadow → `shadow_<model>_<mode>`,
-  `shadow_<model>_agent_reg<λ>` (agent mode + reg), `shadow_<model>_qvalue_<switch_critic>`
-  (TD3 q-value).
+- `schema.py` — **the shared typed vocabulary** (depends only on `models`; no cycles). StrEnums:
+  `Scenario`, `Algorithm {ddpg,td3}`, `MethodRole {model,pid,nmpc_oracle}`, `Device {cpu,gpu}`
+  (+ re-uses `SwitchingMode`/`TD3SwitchCritic` from `models`). Dataclasses (frozen, with
+  `to_json`/`from_json` via an `asdict(dict_factory=…)` single pass):
+  - `Condition` — a learner config (algorithm + shadow settings). The **single factory** for
+    both the run-label slug (`.slug` via `run_label_for()`) and the metadata (`.to_run_spec()`);
+    `__post_init__` rejects incoherent combos. Helpers `standard(...)` / `shadow(...)`.
+  - `RunSpec` — a Condition bound to (scenario, seed, total_steps); written as `run.json`.
+    `.artifact_stem` gives the rollout filename stem.
+  - `ModelSpec` — checkpoint path + its `RunSpec` (the typed input to `run_rollouts`).
+  - `MethodRecord` — one structured rollout-manifest entry (role + optional `RunSpec`).
+  - Protocols `ReferenceController` / `ShadowAgent` (`RolloutController` union) replace `object`.
 
-- `evaluate.py` — runs models + reference controllers on a scenario and **serialises raw
-  per-step rollouts** to disk; it does NOT plot or compute metrics (that utility is to be built).
-  - Exports `run_episode` and `evaluate`, **reused by `train.py`** (the shared episode runner /
-    deterministic evaluator).
-  - `run_rollouts()` runs PID + NMPC oracle + every given/discovered model for `n_seeds` seeds and
-    writes one `<slug>.npz` per method + a `manifest.json` under
-    `outputs/rollouts/<scenario>/<timestamp>/`. Arrays per method (`[N, T, ...]`): `states`
+- `train.py` — standard OR shadow training, custom core. **No CLI** — programmatic API:
+  - `train_condition(condition, scenario, total_steps, seed, *, eval_freq, checkpoint_freq,
+    device, output_dir, per_seed_dir)` — trains one `Condition` on one (scenario, seed). The
+    Condition is the single source of the agent hyperparameters, the slug, and the `RunSpec`.
+  - `train_model(agent, run_spec, *, …)` — the inline episode-based loop. Periodic deterministic
+    eval every `eval_freq` steps; saves `best.pt` on eval improvement (always guarantees a
+    `best.pt` exists). Writes **`run.json`** (the RunSpec) + a behaviour-time **`training_log.npz`**
+    per run (per-episode behaviour return + violation count/rate/max + takeover; per-eval
+    deterministic return + takeover; JSON `meta`), plus `takeover.png`/`.npz` for shadow runs.
+  - Run-label slugs (via `schema.run_label_for`): standard → `ddpg`/`td3`; shadow →
+    `shadow_<algo>_<mode>`, `…_agent_reg<λ>`, `…_qvalue_<switch_critic>` (TD3 q-value).
+
+- `evaluate.py` — runs models + references on a scenario and **serialises raw per-step rollouts**;
+  no plotting/metrics (that is Phase 4). **No CLI.**
+  - `run_episode(...)` — the shared per-episode runner, reused by `train.py`.
+  - `run_rollouts(scenario, model_specs: list[ModelSpec], n_seeds, use_oracle, …)` runs PID +
+    NMPC oracle + every given model, writing one `<run.artifact_stem>.npz` per model (+ `pid.npz`/
+    `nmpc_oracle.npz`) and a `manifest.json` under `outputs/rollouts/<scenario>/<timestamp>/`.
+    Method identity is carried by **`MethodRecord`** (role + `RunSpec`), in the manifest and each
+    `.npz`'s `meta` — never parsed from a filename. Per-method arrays `[N, T, …]`: `states`
     (physical `env.state`), `obs`, `actions`, `actions_agent`, `actions_baseline`, `rewards`,
-    `takeover` (1=agent / 0=baseline / NaN=N/A). Manifest carries scenario timing, `plot_config`,
-    setpoint schedule, method list, and the array schema.
-  - Model loading is **inline** (`torch.load` → dispatch on `ckpt["type"]` via
-    `get_shadow_model` / `get_standard_model`) — there is no separate `load_model` function and
-    no SB3 adapters.
-  - **Does NOT capture `info["cons_info"]`** yet — adding a per-step `violations` array is the
-    other half of Phase 2.
-  - CLI: `--scenario --models --n-seeds --no-oracle --mpc-horizon --output-dir --cpu`.
+    `takeover` (1/0/NaN), **`q_gap`** (C3 advantage; NaN if N/A), **`violations`** `[N,T,n_con]`
+    (from `env.state` vs `constraint_spec`). Manifest carries timing, `plot_config`, setpoints,
+    `constraints`, and the array schema.
 
-- `demo_takeover.py` — standalone demonstration (not part of the train/eval pipeline). Trains
-  `ShadowDDPG` (q-value) via the *real* `run_episode` code path and plots the **deterministic
-  (greedy) takeover fraction over training**, reproducing Gassert & Althoff Fig. 4 (high early
-  takeover from a random critic, trending down as control is "earned"). Exists because `train.py`
-  deliberately does not log/plot training metrics. Writes `outputs/takeover_<scenario>.png` + `.npz`.
+- `experiments.py` — **declarative config** (not execution). `GRIDS` registry of named
+  `ExperimentGrid`s (envs × `Condition`s × seeds + budgets/rollout settings). Helpers:
+  `iter_training_jobs`, `iter_model_refs`, `checkpoint_path`, `describe_grid`, `write_provenance`
+  (snapshots resolved grid + git commit + lib versions). Grid building blocks live here; the
+  `Condition` type itself lives in `schema.py`.
+
+- `run_experiments.py` — **Phase-3 orchestrator** (programmatic, no CLI). `run_grid(grid, …)`
+  writes provenance then runs `train_grid` (drives `train_condition`; resumable — skips existing
+  `best.pt`; isolates per-job failures) and `rollout_grid` (builds `ModelSpec`s straight from the
+  grid `Condition`s, calls `run_rollouts`). `override_grid(...)` subsets a grid for smoke runs;
+  `Stage {all,train,rollouts}` selects stages.
+
+- `constraints.py` — constraint-violation **detection** (`violation_magnitudes`, from `env.state`)
+  + **metrics** (`constraint_metrics`: count/rate/magnitude/median+MAD, timing). Library only.
 
 - `dissertation_plan.md` — the experiment plan and codebase-readiness assessment (see Project
   Overview). **The source of truth for what to build next.**
@@ -185,23 +214,27 @@ layer is **one custom PyTorch core** — there is no longer a second (SB3) backe
 - `requirements.txt` — dependencies (see above).
 
 ### Output layout
-- `outputs/models/<scenario>/<run_label>/` — `best.pt` (best-evaluating) + periodic `epN.pt`
-  snapshots. Run-label names as listed under `train.py` above. `evaluate.py` infers the human
-  label from the loaded checkpoint's `label` property, not the dir name.
-- `outputs/rollouts/<scenario>/<timestamp>/` — `evaluate.py` output: `<slug>.npz` per method +
-  `manifest.json` (raw per-step rollouts for the to-be-built plotting/metrics utility).
-- `outputs/takeover_<scenario>.png` / `.npz` — `demo_takeover.py` output.
+- `outputs/models/<scenario>/<run_label>[/seed<k>]/` — `best.pt` (best-evaluating; `per_seed_dir`
+  adds the `seed<k>` leaf for multi-seed runs) + `run.json` (the `RunSpec`) + `training_log.npz`
+  (+ `takeover.png`/`.npz` for shadow runs). Snapshots `epN.pt` only if `checkpoint_freq > 0`
+  (default 0).
+- `outputs/rollouts/<scenario>/<timestamp>/` — `run_rollouts` output: one `.npz` per method
+  (`<run_label>__seed<k>.npz`, `pid.npz`, `nmpc_oracle.npz`) + `manifest.json` with structured
+  `MethodRecord`s. Raw per-step rollouts for the Phase-4 analysis utility.
+- `outputs/experiments/<grid>/provenance.json` — resolved grid + git commit + library versions.
 - `outputs/runs/`, `outputs/analysis/`, `runs/` — stale artifacts from the removed plotting
-  subsystem / pre-refactor runs. Not written by current scripts.
+  subsystem / pre-refactor runs. Not written by current code.
 
-### Typical workflow
-```bash
-.venv/Scripts/python train.py    --scenario cstr --model ddpg                       # standard DDPG
-.venv/Scripts/python train.py    --scenario cstr --model ddpg --shadow              # Shadow DDPG (qvalue)
-.venv/Scripts/python train.py    --scenario cstr --model td3  --shadow --mode agent --lambda-reg 2.0
-.venv/Scripts/python evaluate.py --scenario cstr --n-seeds 20                       # write rollouts (no plots)
-.venv/Scripts/python demo_takeover.py --scenario cstr --steps 40000                 # takeover-trend demo plot
-# plotting/metrics + multi-seed orchestration utilities: TO BE BUILT (dissertation_plan.md Phases 3–4)
+### Typical workflow (programmatic — no CLI)
+```python
+from experiments import GRIDS
+from run_experiments import run_grid, override_grid
+from schema import Device
+
+grid = GRIDS["phase1_cstr_fourtank"]                       # envs × conditions × seeds
+grid = override_grid(grid, env_names=["cstr"], seeds=[0,1], steps=5000)  # smaller smoke grid
+run_grid(grid, device=Device.CPU)                          # train + rollouts + provenance
+# Phase-4 analysis utility (metrics/figures from the rollout .npz + training_log.npz): TO BE BUILT
 ```
 
 ## Metrics
@@ -217,24 +250,25 @@ Target metric set for evaluating each method across seeds:
 - **Robustness**: MAD/IQR/worst-case return across seeds.
 - **Control effort**: total/mean |Δu|.
 - **Optimality gap**: Δ = J(π*) − J(π_θ), π* = NMPC oracle (`models.NMPCController`, recorded in
-  every rollout unless `--no-oracle`). Normalise scores `[PID = 0, oracle = 1]` for cross-env
+  every rollout unless `use_oracle=False`). Normalise scores `[PID = 0, oracle = 1]` for cross-env
   aggregation. Use `rliable` (IQM, bootstrap CIs, P(Shadow > Pure)) for robust stats.
 
 ## Metrics Pipeline (current state)
 Decoupled run → store → (rebuild) analyse:
-- **Evaluation side (built).** `evaluate.run_rollouts()` writes raw per-step rollouts to
-  `outputs/rollouts/<scenario>/<timestamp>/`. No plotting/metrics in evaluate.py by design.
-  **Gap:** does not yet capture `info["cons_info"]` (no `violations` array).
-- **Training side (minimal).** `train.py`/`train_model` trains + saves best/snapshot checkpoints
-  but does NOT serialise behaviour-time training metrics. **Gap:** a lightweight per-run
-  `training_log.npz` (step, behaviour return, behaviour violations, takeover %, eval return) is a
-  required re-add for the C1/C3/C4 claims.
-- **Orchestration (missing).** `train.py` is single-run; a `run_experiments.py` looping
-  conditions × seeds × envs is to be built (Phase 3).
-- **Plotting / metrics utility (missing — the main build).** A new `analysis.py` should load the
-  rollout `.npz` + `manifest.json` + per-run `training_log.npz` and emit the metric tables (CSV)
-  and figures (PNG). See `dissertation_plan.md` Phase 4 for the exact metric/figure list and the
-  "Removed subsystem" note below for the reference behaviour + the user's learned plot preferences.
+- **Evaluation side (built).** `evaluate.run_rollouts()` writes raw per-step rollouts incl.
+  `violations` (from `env.state` vs `constraint_spec`) and `q_gap`, with structured `MethodRecord`
+  metadata. (Phase 2 ✅)
+- **Training side (built).** `train_model` serialises a per-run `training_log.npz` (behaviour
+  return + violation count/rate/max + takeover per episode; deterministic eval return + takeover
+  per boundary) + `run.json`. (Phase 2 ✅)
+- **Orchestration (built).** `run_experiments.run_grid()` loops conditions × seeds × envs
+  (resumable, provenance, failure-isolated). (Phase 3 ✅)
+- **Plotting / metrics utility (MISSING — the main build, Phase 4).** A new `analysis.py` should
+  load the rollout `.npz` + `manifest.json` + per-run `training_log.npz` and emit metric tables
+  (CSV) + figures (PNG): control (IAE/ISE, overshoot, settling, offset, median+MAD return), safety
+  (C1), optimality gap (C2), learning curves, takeover analysis (C3), and `rliable` robust stats.
+  See `dissertation_plan.md` Phase 4 and the "Removed subsystem" note below for the user's learned
+  plot preferences.
 
 ## Removed: training-metrics & plotting subsystem (historical reference)
 Deleted 2026-06-05 ("this isn't working… we can do better"); the model layer was then further
@@ -252,8 +286,14 @@ live in `dissertation_plan.md`. Key user preferences to preserve when rebuilding
 
 ## Coding Conventions
 - Add new environments to the `SCENARIOS` registry in `scenarios.py`; add new models to
-  `models.py`. Keep training scripts thin — the training loop lives in `train.py:train_model`.
-- Reuse `run_episode` / `evaluate` from `evaluate.py` rather than re-implementing rollouts/loops.
+  `models.py`; add new experiment grids/conditions to `experiments.py` (`GRIDS`, `Condition`).
+  Keep the training loop in `train.py:train_model`.
+- Reuse `run_episode` from `evaluate.py` rather than re-implementing rollouts/loops.
+- **Typed metadata, no slugs.** New run/method metadata goes in `schema.py` dataclasses
+  serialised to JSON; categorical values are StrEnums; type-hint everything. Never derive a run's
+  identity by parsing a directory/file name — read the `RunSpec`/`MethodRecord`.
+- **No CLIs.** Modules are libraries invoked programmatically (e.g. `run_experiments.run_grid`).
+  Don't re-add argparse unless explicitly asked.
 - **One backend.** All agents share the custom DDPG/TD3 core. Standard vs shadow is the fair
   ablation (`DDPG`/`TD3` vs `ShadowDDPG`/`ShadowTD3` — identical learner, switching off). Don't
   reintroduce SB3 unless explicitly asked.

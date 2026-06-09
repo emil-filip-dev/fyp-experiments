@@ -189,9 +189,9 @@ Aim to be able to write, with statistics behind every clause:
 | Save / load + run-label dirs | ✅ Ready | None. |
 | Training loop (`train.py`) | ✅ Ready | Behaviour-time logger DONE — `training_log.npz` per run (behaviour return + violation count/rate/max + takeover per episode; deterministic eval return + takeover per boundary). |
 | Rollout recorder (`evaluate.run_rollouts`) | ✅ Ready | Per-step `violations` array DONE (computed from `env.state` vs `constraint_spec`, in every `.npz` + manifest). `q_gap` recorded too. |
-| Multi-seed / multi-condition orchestration | ❌ Missing | `train.py` is single-run. Add a runner that loops conditions × seeds × envs (Phase 3). The config layer (`experiments.py`) + `per_seed_dir` support already exist. |
-| Metrics / analysis utility | ❌ Missing | Biggest build. Consume rollouts + training logs → control metrics (IAE/ISE, overshoot, settling, offset), safety metrics, takeover analysis, optimality gap, learning curves. |
-| Robust statistics (`rliable`) | 🟡 Installed | `rliable` installed in `.venv`; still to wire IQM + bootstrap CIs + probability-of-improvement into the analysis utility. |
+| Multi-seed / multi-condition orchestration | ✅ Ready | `run_experiments.py` executes a grid (train → rollouts), resumable + provenance. Metadata is structured (StrEnums + `schema.py` dataclasses → `run.json` / manifest `MethodRecord`s), never slug-derived. |
+| Metrics / analysis utility (`analysis.py`) | ✅ Built | Typed loaders (rollouts + run.json + training_log); control (return median+MAD, IAE/ISE, offset, overshoot, settling-time); safety (deployment rate/count/max + time-to-recovery + C1 cumulative); optimality gap [PID=0,oracle=1]; learning curves + steps-to-threshold + AUC; C3 takeover over training + transient-vs-steady bucketing; trajectory overlays (tracking + constrained-variable). CSV (18 cols) + claim-tagged PNGs. Metric fns unit-tested. |
+| Robust statistics (`rliable`) | ✅ Wired | `analysis.aggregate_scenarios` → IQM + 95% bootstrap CI (`iqm_with_ci`) + `prob_improvement` (P(Shadow>Pure)). |
 
 **Summary:** the *learning* machinery AND the *capture* machinery (constraints, behaviour-time
 logging, rollout violations) are done. Remaining gaps are **orchestration** (Phase 3) and the
@@ -231,26 +231,37 @@ result; `[stretch]` = strengthens the thesis if time allows.
 - [x] `[stretch]` Record `Q(agent) − Q(baseline)` per rollout step (`q_gap`) for the
       takeover-vs-advantage analysis (C3). Verified: +adv when agent acts, −adv when it defers.
 
-### Phase 3 — Orchestration (≈30 min, new `run_experiments.py`)
-- [ ] `[core]` Script that loops conditions × seeds × envs, calling the existing `train()` and
-      then `run_rollouts()`; write everything under `outputs/` with consistent naming.
-- [ ] `[core]` Support `--steps`, `--seeds`, `--envs`, `--conditions` and run training jobs in
-      the background so the analysis utility can be built in parallel.
+### Phase 3 — Orchestration (`run_experiments.py`)  ✅ DONE
+- [x] `[core]` Executor that loops conditions × seeds × envs, calling the existing `train()`
+      then `run_rollouts()`; outputs under `outputs/models|rollouts|experiments/`. Resumable
+      (skips existing checkpoints) + `write_provenance()` (grid + git + lib versions).
+- [x] `[core]` CLI `--grid --envs --seeds --steps --stage --device --dry-run --force`; runs in
+      the background fine (Phase-2 logger persists incrementally).
+- [x] `[core]` **Design compliance**: run metadata lives in typed objects — `schema.py`
+      StrEnums (`Scenario`, `MethodRole`, `Device`) + dataclasses (`RunSpec`, `ModelSpec`,
+      `MethodRecord`) serialised to `run.json` (per checkpoint) and the rollout manifest /
+      self-describing `.npz` `meta`. Identity is NEVER parsed from a directory slug; slugs only
+      *locate* files. `evaluate.run_rollouts` now takes `list[ModelSpec]` (no `parent.name`).
 
-### Phase 4 — Metrics / analysis utility (≈2–3 h, new `analysis.py`)
-- [ ] `[core]` Loader: read `outputs/rollouts/<env>/<ts>/*.npz` + `manifest.json` + per-run
-      `training_log.npz`.
-- [ ] `[core]` **Control metrics**: median + MAD deployed return, IAE/ISE per output,
-      overshoot / settling time / steady-state offset per setpoint segment.
-- [ ] `[core]` **Safety metrics (C1)**: violation rate / count / max magnitude /
-      time-to-recovery; cumulative training-time violations vs step (Shadow vs Pure).
-- [ ] `[core]` **Optimality gap (C2)**: Δ = J(NMPC) − J(π), normalised `[PID=0, oracle=1]`.
-- [ ] `[core]` **Learning curves**: deterministic eval median + IQR band; steps-to-threshold, AUC.
-- [ ] `[core]` **Takeover analysis (C3)**: takeover fraction over training, and bucketed by
-      episode phase (transient vs steady-state).
-- [ ] `[core]` **Robust stats**: integrate `rliable` IQM + stratified-bootstrap CIs +
-      probability of improvement P(Shadow > Pure).
-- [ ] `[core]` Emit result **tables (CSV) + figures (PNG)** ready to drop into the dissertation.
+### Phase 4 — Metrics / analysis utility (`analysis.py`)  ✅ CORE DONE
+- [x] `[core]` Typed loaders: rollout `*.npz` + `manifest.json` (`MethodRecord`) + per-run
+      `run.json` (`RunSpec`) + `training_log.npz` (`RolloutArrays` / `TrainingArrays` dataclasses).
+- [x] `[core]` **Control metrics**: median + MAD deployed return, IAE/ISE per output, steady-state
+      offset, overshoot, and settling-time per setpoint segment.
+- [x] `[core]` **Safety (C1)**: deployment violation rate/count/max (reuse `constraint_metrics`) +
+      time-to-recovery; cumulative training-time violations vs step (Shadow vs Pure) figure.
+- [x] `[core]` **Optimality gap (C2)**: Δ = J(NMPC) − J(π), normalised `[PID=0, oracle=1]`
+      (handles the no-oracle scenario gracefully).
+- [x] `[core]` **Learning curves**: deterministic eval median + IQR band; steps-to-threshold (vs
+      PID level) + AUC.
+- [x] `[core]` **Takeover (C3)**: deployment takeover fraction over training + transient-vs-steady
+      bucketing of deployment takeover (the "earned takeover" signal).
+- [x] `[core]` **Robust stats**: `aggregate_scenarios` → rliable IQM + stratified-bootstrap CI +
+      `prob_improvement` P(Shadow > Pure).
+- [x] `[core]` Emit **tables (CSV) + figures (PNG)**, claim-tagged (`c1_*`/`c2_*`/`c3_*`).
+- [x] `[stretch]` Overshoot/settling, time-to-recovery, steps-to-threshold/AUC, takeover
+      phase-bucketing, + trajectory-overlay figures (tracking + constrained variable). Metric
+      functions unit-tested against known answers.
 
 ### Phase 5 — Run & generate results (≈1–2 h wall-clock, mostly background)
 - [ ] `[core]` Train all conditions × seeds for `cstr` (and `four_tank` if time), background jobs.
