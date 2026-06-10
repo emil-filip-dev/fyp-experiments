@@ -6,20 +6,26 @@ Operate autonomously. Do not ask for confirmation before taking actions unless t
 ## Project Overview
 Imperial College London FYP: Making RL reliable enough for industrial process control via hard constraint satisfaction.
 
-Core research direction: Extend Shadow Mode RL (Gassert & Althoff, 2024) to PC-Gym benchmark environments, combining it with constraint-handling mechanisms from CIRL and learning-to-defer frameworks.
+Core research direction (per **`project_proposal.md`** — the authoritative brief):
+**OFFLINE** RL for process control. Pretrain an RL controller on historical + simulated
+process data (no live exploration), introduce it in **shadow mode** alongside an established
+expert (MPC), **graduate** its autonomy as confidence is earned, and test whether it can
+finally **operate on its own**. (The earlier codebase implemented Gassert & Althoff's *online*
+shadow mode, which contradicts the proposal; it was reframed to offline in 2026-06.)
 
-The empirical goal and the experiment design are spelled out in **`dissertation_plan.md`** —
-the authoritative roadmap. It decomposes "shadow mode works" into four falsifiable claims
-(C1 safety-during-training, C2 no-performance-sacrifice, C3 selective/earned takeover,
-C4 reliability), defines the comparison set and statistics, and ends with a codebase-readiness
-table + phased TODO. **Read it before doing experiment work.**
+The pipeline, claims, and experiment design are in **`dissertation_plan.md`** (reframed roadmap);
+the engineering map is in **`PROGRAM_OVERVIEW.md`**. Claims: C1 offline-learnability,
+C2 safe-introduction, C3 graduated-autonomy, C4 standalone-autonomy+reliability. **Read both
+before doing experiment work.**
 
 ## Key Papers
-1. **Shadow Mode RL** (Gassert & Althoff, 2024) — core method being extended
-2. **PC-Gym** (Bloor et al., 2024) — benchmark environments (CSTR, crystallization, four-tank, multistage extraction)
-3. **CIRL** (Bloor et al., 2024) — PID-embedded RL policy for process control
-4. **RL Survey for PSE** (Bloor et al., 2025) — background and metrics
-5. **Learning-to-Defer / SLTD** (Joshi et al., 2022) — deferral framework for sequential decisions
+1. **TD3+BC** (Fujimoto & Gu, 2021) — the offline RL algorithm used for pretraining
+2. **Shadow Mode RL** (Gassert & Althoff, 2024) — source of the earned-takeover switching idea
+   (their method is *online*; we apply the switch to an *offline-pretrained* agent)
+3. **PC-Gym** (Bloor et al., 2024) — benchmark environments (CSTR, crystallization, four-tank, multistage extraction)
+4. **CIRL** (Bloor et al., 2024) — PID-embedded RL policy for process control
+5. **RL Survey for PSE** (Bloor et al., 2025) — background and metrics
+6. **Learning-to-Defer / SLTD** (Joshi et al., 2022) — deferral framework for sequential decisions
 
 ## Environment
 - **Python**: 3.12 via `.venv` (use `.venv/Scripts/python` — do NOT use system Python)
@@ -29,6 +35,21 @@ table + phased TODO. **Read it before doing experiment work.**
 - **OS**: Windows. Default shell is PowerShell; a Bash tool is also available.
   `util.configure_utf8_output()` exists for non-ASCII stdout on Windows but is no longer
   auto-invoked (the CLIs were removed — see below); call it yourself in a driver if needed.
+- **Long-running tasks → ALWAYS launch in a new visible WINDOWS TERMINAL window** (`wt`), running
+  **cmd** (user preference). Do NOT use a PowerShell window: PS 5.1 red-wraps a native exe's
+  stderr as `NativeCommandError`, and tqdm writes its progress bars to stderr, so a PS launch
+  fills the window with spurious red errors. cmd shows stderr cleanly. Tee to a log via the
+  repo's `tee.py` so the run is also monitorable:
+  ```bat
+  wt.exe new-tab --title "<title>" -d "<repo>" cmd /k ".venv\Scripts\python.exe -u driver.py 2>&1 | .venv\Scripts\python.exe tee.py run.log"
+  ```
+  (`-u` unbuffered; cmd's `2>&1` merges stderr as plain text — no error-wrapping; `tee.py` mirrors
+  to `run.log`, which the agent tails for progress/completion since a detached window emits no
+  harness completion notification; read the log with `Get-Content`/Read). Applies to full pipeline
+  runs, multi-seed/grid runs, and any NMPC-heavy job. **Prefer CPU (`Device.CPU`) for long
+  unattended runs** — a CPU process survives a Windows user-switch, whereas a CUDA process is
+  killed when its session is switched/disconnected; the workload is NMPC-bound so the GPU buys
+  little anyway.
 
 ## Dependencies (requirements.txt)
 tqdm, numpy, matplotlib, casadi, jax[cpu], equinox, diffrax, do-mpc[full], pcgym.
@@ -69,16 +90,17 @@ obs, reward, terminated, truncated, info = env.step(action)
 ```
 
 ## Codebase Architecture
-A small set of shared **library modules** (no CLIs — invoked programmatically; the argparse
-entry points were removed for simplicity). `schema.py` holds the typed vocabulary (StrEnums +
-dataclasses); scenarios, models, and the episode runner are factored out so training and
-evaluation share the same code paths. The model layer is **one custom PyTorch core** — there
-is no second (SB3) backend.
+A small set of shared **library modules** (no CLIs — invoked programmatically). **The
+authoritative module map is `PROGRAM_OVERVIEW.md`** — read it. The pipeline is
+`data.py` (offline dataset) → `pretrain.py` (offline TD3+BC/DDPG+BC) → `deploy.py`
+(staged shadow→autonomous), orchestrated by `pipeline.py`. The model layer is
+**one custom PyTorch core** — no SB3.
 
 **Design rules (enforced):** run metadata lives in **typed objects serialised to JSON**
 (`schema.py`: `RunSpec`, `ModelSpec`, `MethodRecord`), never derived from directory slugs;
-categorical values are **StrEnums** (`Scenario`, `Algorithm`, `SwitchingMode`, `TD3SwitchCritic`,
-`MethodRole`, `Device`), not bare strings; type hints everywhere. Slugs only *locate* files.
+categorical values are **StrEnums** (`Scenario`, `Algorithm`, `TrainingMode`, `ExpertKind`,
+`DeploymentStage`, `MethodRole`, `Device`), not bare strings; type hints everywhere. Slugs
+only *locate* files.
 
 - `scenarios.py` — central registry (`SCENARIOS` dict) of all four PC-Gym environments.
   **`env_params` are copied VERBATIM from PC-Gym's own paper training scripts**
@@ -89,8 +111,10 @@ categorical values are **StrEnums** (`Scenario`, `Algorithm`, `SwitchingMode`, `
   verified verbatim copy is the whole point. The earlier hand-reconstructed configs were wrong
   (crystallization conc off ~1000× → NaN; multistage controlled the wrong variable; etc.).
   Each entry also carries `state_dim`, `action_dim`, `n_steps`, a `baseline_cls`, `plot_config`
-  — these last two are **ours** (not PC-Gym), the baseline being a PID/PI safety-net for shadow
-  mode that drives the SAME variable(s) PC-Gym controls. **All four train with DDPG + shadow DDPG.**
+  — these last two are **ours** (not PC-Gym). The `baseline_cls` PID/PI drives the SAME
+  variable(s) PC-Gym controls; it is the cheap reference floor and the **PID expert** for
+  scenarios the NMPC cannot model (crystallization). **`scenarios.py` and `constraints.py` are
+  untouched by the offline reframe — treat them as fixed.**
   - **Controlled variables / setup (per the verbatim source):** `cstr` Ca via Tc, a_space
     [295,302], SP 3-segment 0.85/0.9/0.87, N=60. `four_tank` controls **h3 & h4** (not h1/h2),
     a_space [0.1,0.1]–[10,10], o_space [0,0.6], noise 5%, tsim=1000 (slow). `multistage_extraction`
@@ -111,131 +135,131 @@ categorical values are **StrEnums** (`Scenario`, `Algorithm`, `SwitchingMode`, `
     over-depletion) are **OURS**, physically-calibrated so nominal control stays inside while
     exploration crosses them — full justification in `constraints_rationale.md`.
 
-- `models.py` — all model definitions, one shared core; variants differ only in `decide_action`,
-  a clean ablation set.
-  - **Building blocks**: `Actor` (q-value mode → action vector; agent mode → `(action,
-    decision_prob∈[0,1])`), `Critic` (single Q, used by ShadowDDPG), `CriticTwin` (twin Q1/Q2
-    with `q_min` / `q1_only`, used by ShadowTD3), `ReplayBuffer` (stores executed action +
-    agent action + baseline action per transition). Abstract base `_ShadowModel` holds the
-    shared `decide_action` / `store` / `save` / `load` logic, plus `q_gap(obs, baseline_action)`
-    → `Q(s, a_agent) − Q(s, a_baseline)` under the switching critic (q-value only; NaN for
-    agent-mode / non-RL) — recorded per rollout step for the takeover-vs-advantage analysis (C3).
-  - **Shadow agents** `ShadowDDPG` / `ShadowTD3`. Switching `mode`:
-    - `qvalue` (`SwitchingMode.Q_VALUE`) — act if `Q(s, a_agent) > Q(s, a_baseline)` (Eq. 6;
-      compares on the deterministic policy action, executes the noised one).
-    - `agent` (`SwitchingMode.AGENT`) — the actor emits a control-authority probability; act if
-      `> eta_agent` (Eq. 4). Optional `lambda_reg` adds an L1 reward penalty `−λ‖a_agent −
-      a_baseline‖` toward the baseline (Eq. 5; **agent mode only** — shapes the reward/Q, not
-      the actor loss). In agent mode the critic operates on the augmented action `(a^a,
-      a^decision)` → `action_dim + 1` inputs.
-    - `ShadowTD3` adds twin critics, delayed policy updates, target-policy smoothing, and a
-      `switch_critic` choice (`TD3SwitchCritic`: `q1` actor-consistent default, or `qmin`
-      conservative) used **only** for its q-value switching decision.
-  - **Standard (no-shadow) agents** `DDPG(ShadowDDPG)` / `TD3(ShadowTD3)` — same core, but
-    `decide_action` is overridden to **always execute the agent's own action** (switching off).
-    These are THE fair "standard DDPG/TD3" baseline for the shadow ablation (identical learner,
-    hyperparameters, PID-assisted warmup). Labelled `"DDPG"` / `"TD3"`.
-  - **Enums / dispatch**: `StandardModels {ddpg, td3, ppo}`, `ShadowModels {ddpg, td3}`.
-    `get_standard_model(name)` / `get_shadow_model(name)` return the class. **Note:** `ppo` is
-    listed in `StandardModels` but **not implemented** (no PPO class; `get_standard_model`
-    raises for it) — shadow switching needs a deterministic off-policy actor-critic.
-  - **Save/load**: `agent.save(path)` writes a dict checkpoint via `_save_dict()` — keys: `type`
-    (a `StandardModels`/`ShadowModels` enum), all hyperparameters, `state_dicts`, and `internal`
-    (replay buffer, `total_steps`, takeover counts). Classmethod `Model.load(ckpt, device)`
-    reconstructs from that dict. Checkpoint files: `best.pt` (best eval) + `epN.pt` (snapshots).
-  - **`NMPCController`** — NMPC oracle (best-achievable reference / optimality-gap ceiling).
-    Wraps PC-Gym's own do-mpc `oracle` (CasADi + IPOPT) so the prediction model is *exactly*
-    the env dynamics; exposes `.predict(obs)` / `.reset()` like the PID baselines and runs true
-    receding-horizon against the noisy env. **Setpoint-tracking only** — raises
-    `NotImplementedError` on scenarios with disturbances or delta-u. Overrides PC-Gym's buggy
-    `p_fun` with a scalar-safe, non-lagging setpoint lookup.
+- `models.py` — agents + deployment + NMPC, one shared PyTorch core.
+  - **Building blocks**: `Actor` (deterministic π(s)→action), `Critic` (single Q, DDPG),
+    `CriticTwin` (Q1/Q2 with `q_min`/`q1_only`, TD3), `ReplayBuffer` (5-tuple (s,a,r,s',done);
+    `add_many` for the static offline dataset). Abstract base `_BaseAgent` holds `act`,
+    `q_value`, `q_gap(obs, expert_action)` → `Q(s,π(s)) − Q(s,a_expert)` (the earned-takeover
+    signal, C3), `store`, `load_dataset`, `save`/`load`.
+  - **Offline agents** `TD3Agent` / `DDPGAgent` — TD3+BC / DDPG+BC (Fujimoto & Gu 2021): actor
+    loss mixes `−λ·Q(s,π(s))` with a BC term `‖π(s)−a_data‖²`, with `λ = bc_alpha/mean|Q|`.
+    `bc_alpha=0` recovers plain TD3/DDPG (the online contrast). `update()` is one gradient step
+    from the buffer — used identically for offline, offline→online, and online phases.
+    `get_agent(algorithm)` returns the class. `total_updates` (grad steps) / `total_env_steps`.
+  - **`DeploymentStage {shadow, autonomous}`** and **`ShadowController(agent,
+    expert)`** — `decide(obs, stage, margin)` returns `(a_exec, used_agent, a_agent, a_expert)`:
+    **shadow**→agent iff `q_gap > margin` else expert (the headline earned-takeover mode);
+    autonomous→agent (optional expert safety fallback). Used for both staged evaluation and
+    o2o data collection.
+  - **Save/load**: `agent.save(path)` writes a dict via `_save_dict()` — keys `type` (an
+    `AgentType`), hyperparameters, `state_dicts`, `internal`. `get_agent(type).load(ckpt, device)`
+    reconstructs. Checkpoint file: `best.pt`.
+  - **`NMPCController`** — do-mpc + IPOPT NMPC on the env's *exact* dynamics. It is BOTH the
+    **MPC expert** (setpoint-tracking scenarios) and the optimality-gap ceiling. `.predict(obs)`/
+    `.reset()`. Raises `NotImplementedError` on disturbances/delta-u (→ PID expert instead).
+    Scalar-safe, non-lagging `p_fun`.
 
-- `util.py` — `configure_utf8_output()`, `resolve_device("cpu"|"gpu")` (accepts a `Device`
-  StrEnum too, since it's a `str`), `device_label()`.
+- `experts.py` — `make_expert(scenario)` → `(controller, ExpertKind)`: NMPC for setpoint-tracking
+  scenarios, PID baseline fallback for delta-u/disturbance scenarios (crystallization).
+  `expert_kind_for(scenario)` gives the kind without constructing.
 
-- `schema.py` — **the shared typed vocabulary** (depends only on `models`; no cycles). StrEnums:
-  `Scenario`, `Algorithm {ddpg,td3}`, `MethodRole {model,pid,nmpc_oracle}`, `Device {cpu,gpu}`
-  (+ re-uses `SwitchingMode`/`TD3SwitchCritic` from `models`). Dataclasses (frozen, with
-  `to_json`/`from_json` via an `asdict(dict_factory=…)` single pass):
-  - `Condition` — a learner config (algorithm + shadow settings). The **single factory** for
-    both the run-label slug (`.slug` via `run_label_for()`) and the metadata (`.to_run_spec()`);
-    `__post_init__` rejects incoherent combos. Helpers `standard(...)` / `shadow(...)`.
-  - `RunSpec` — a Condition bound to (scenario, seed, total_steps); written as `run.json`.
-    `.artifact_stem` gives the rollout filename stem.
-  - `ModelSpec` — checkpoint path + its `RunSpec` (the typed input to `run_rollouts`).
-  - `MethodRecord` — one structured rollout-manifest entry (role + optional `RunSpec`).
-  - Protocols `ReferenceController` / `ShadowAgent` (`RolloutController` union) replace `object`.
+- `util.py` — `configure_utf8_output()`, `resolve_device("cpu"|"gpu")`, `device_label()`.
 
-- `train.py` — standard OR shadow training, custom core. **No CLI** — programmatic API:
-  - `train_condition(condition, scenario, total_steps, seed, *, eval_freq, checkpoint_freq,
-    device, output_dir, per_seed_dir)` — trains one `Condition` on one (scenario, seed). The
-    Condition is the single source of the agent hyperparameters, the slug, and the `RunSpec`.
-  - `train_model(agent, run_spec, *, …)` — the inline episode-based loop. Periodic deterministic
-    eval every `eval_freq` steps; saves `best.pt` on eval improvement (always guarantees a
-    `best.pt` exists). Writes **`run.json`** (the RunSpec) + a behaviour-time **`training_log.npz`**
-    per run (per-episode behaviour return + violation count/rate/max + takeover; per-eval
-    deterministic return + takeover; JSON `meta`), plus `takeover.png`/`.npz` for shadow runs.
-  - Run-label slugs (via `schema.run_label_for`): standard → `ddpg`/`td3`; shadow →
-    `shadow_<algo>_<mode>`, `…_agent_reg<λ>`, `…_qvalue_<switch_critic>` (TD3 q-value).
+- `schema.py` — **the shared typed vocabulary** (imports `AgentType`/`DeploymentStage` from
+  `models`; no cycles). StrEnums: `Scenario`, `Algorithm`(=`AgentType` `{ddpg,td3}`),
+  `TrainingMode {offline, offline_to_online, online_contrast}`, `ExpertKind {nmpc, pid}`,
+  `MethodRole {model, pid, nmpc}`, `Device`. Frozen dataclasses with `to_json`/`from_json`:
+  - `Condition` — a learner config (algorithm + training_mode + bc_alpha). **Single factory** for
+    the slug (`.slug`) and metadata (`.to_run_spec()`). Helpers `offline(...)`,
+    `offline_to_online(...)`, `online_contrast(...)`.
+  - `RunSpec` — a Condition bound to (scenario, seed, offline/online budgets, expert_kind);
+    `run.json`. `.artifact_stem` gives the rollout filename stem.
+  - `ModelSpec` — checkpoint + `RunSpec` (input to `deploy.run_rollouts`).
+  - `MethodRecord` — a manifest entry (role + optional `RunSpec` + `DeploymentStage`).
 
-- `evaluate.py` — runs models + references on a scenario and **serialises raw per-step rollouts**;
-  no plotting/metrics (that is Phase 4). **No CLI.**
-  - `run_episode(...)` — the shared per-episode runner, reused by `train.py`.
-  - `run_rollouts(scenario, model_specs: list[ModelSpec], n_seeds, use_oracle, …)` runs PID +
-    NMPC oracle + every given model, writing one `<run.artifact_stem>.npz` per model (+ `pid.npz`/
-    `nmpc_oracle.npz`) and a `manifest.json` under `outputs/rollouts/<scenario>/<timestamp>/`.
-    Method identity is carried by **`MethodRecord`** (role + `RunSpec`), in the manifest and each
-    `.npz`'s `meta` — never parsed from a filename. Per-method arrays `[N, T, …]`: `states`
-    (physical `env.state`), `obs`, `actions`, `actions_agent`, `actions_baseline`, `rewards`,
-    `takeover` (1/0/NaN), **`q_gap`** (C3 advantage; NaN if N/A), **`violations`** `[N,T,n_con]`
-    (from `env.state` vs `constraint_spec`). Manifest carries timing, `plot_config`, setpoints,
-    `constraints`, and the array schema.
+- `data.py` — offline **dataset generation** (the "historical + simulated data"):
+  `generate_dataset(scenario, expert, …)` logs the expert + action perturbations across episodes;
+  `save_dataset`/`load_dataset` (.npz); `dataset_to_buffer` → `ReplayBuffer`. Reports dataset
+  safety (how often the data-collection policy itself violated).
 
-- `experiments.py` — **declarative config** (not execution). `GRIDS` registry of named
-  `ExperimentGrid`s (envs × `Condition`s × seeds + budgets/rollout settings). Helpers:
-  `iter_training_jobs`, `iter_model_refs`, `checkpoint_path`, `describe_grid`, `write_provenance`
-  (snapshots resolved grid + git commit + lib versions). Grid building blocks live here; the
-  `Condition` type itself lives in `schema.py`.
+- `pretrain.py` — training entry points (no CLI). `run_condition(condition, scenario, seed, …)`
+  dispatches on `TrainingMode`:
+  - `pretrain_offline` — TD3+BC/DDPG+BC gradient steps from the static buffer; periodic
+    standalone (autonomous) eval; `best.pt` on improvement.
+  - `finetune_o2o` — conservative offline→online from expert-guarded transitions, sweeping
+    shadow→autonomous.
+  - `train_online_contrast` — naive online RL from scratch (the unsafe foil).
+  Writes `run.json`, `dataset.npz` (offline modes), and `training_log.npz` (mode-specific curve).
 
-- `run_experiments.py` — **Phase-3 orchestrator** (programmatic, no CLI). `run_grid(grid, …)`
-  writes provenance then runs `train_grid` (drives `train_condition`; resumable — skips existing
-  `best.pt`; isolates per-job failures) and `rollout_grid` (builds `ModelSpec`s straight from the
-  grid `Condition`s, calls `run_rollouts`). `override_grid(...)` subsets a grid for smoke runs;
-  `Stage {all,train,rollouts}` selects stages.
+- `deploy.py` — staged deployment + raw rollout serialisation (no plotting). `evaluate_deploy(...)`
+  is the cheap in-memory eval (used by `pretrain`). `run_rollouts(scenario, model_specs, stages,
+  shadow_margins, …)` records PID + NMPC references + every model at each `DeploymentStage`,
+  one `.npz` per method×stage + `manifest.json`. Per-method arrays `[N,T,…]`: `states`, `obs`,
+  `actions`, `actions_agent`, `actions_expert`, `rewards`, `takeover` (1/0/NaN), `q_gap`,
+  `divergence` (‖a_agent−a_expert‖), `violations`.
 
-- `constraints.py` — constraint-violation **detection** (`violation_magnitudes`, from `env.state`)
-  + **metrics** (`constraint_metrics`: count/rate/magnitude/median+MAD, timing). Library only.
+- `experiments.py` — **declarative config**. `GRIDS` registry of `ExperimentGrid`s (envs ×
+  `Condition`s × seeds + budgets/stages/margins). `EnvSpec(name, offline_steps, online_steps)`.
+  Helpers `iter_training_jobs`, `iter_model_refs`, `checkpoint_path`, `describe_grid`,
+  `write_provenance`.
 
-- `dissertation_plan.md` — the experiment plan and codebase-readiness assessment (see Project
-  Overview). **The source of truth for what to build next.**
-- `findings.md` — research notes (literature synthesis, pseudocode, extension designs).
-- `TODO.txt` — current open research tasks.
+- `pipeline.py` — **Phase-3 orchestrator** (no CLI). `run_pipeline(grid, stage=Stage.{all,train,
+  rollouts})` writes provenance then runs `train_grid` (drives `pretrain.run_condition`; resumable;
+  failure-isolated) and `rollout_grid` (`deploy.run_rollouts` per scenario). `override_grid(...)`
+  subsets a grid for smoke runs.
+
+- `analysis.py` — **Phase-4 metrics + plotting** (no CLI). `analyse_rollout_dir(dir)` loads a
+  rollout dir, aggregates model runs across seeds by (condition × stage), writes
+  `metrics_summary.csv` (control / safety / optimality / takeover / divergence / effort) +
+  figures (trajectories, return, normalized score, safety, takeover, box). `plot_training_curve`
+  for learning curves. Robust stats (median/MAD/IQR) + `rliable` IQM/CI. `latest_rollout_dir`.
+  **`plot_takeover_map(run_dir, grid_res, cell_px, sp_value)`** — the RL–MPC **takeover map**:
+  a diverging ΔQ = Q(s,π_RL)−Q(s,a_MPC) heatmap over a 2D state-space slice (CSTR: Ca×T),
+  orange where RL takes over / blue where MPC drives, rendered for every training snapshot to
+  show the takeover boundary evolving (one PNG per snapshot + a combined `takeover_grid.png` →
+  `<run_dir>/takeover_maps/`). Reads `snapshots/` saved by `pretrain` (offline: grad-step;
+  o2o/online: env-step). Works for online-only runs too.
+
+- `constraints.py` — constraint **detection** (`violation_magnitudes`, from `env.state`) +
+  **metrics** (`constraint_metrics`). **Untouched** by the reframe. Library only.
+
+- `dissertation_plan.md` — reframed plan + claims (C1–C4). `PROGRAM_OVERVIEW.md` — engineering map.
+- `project_proposal.md` — the supervisor's brief (the source of truth for scope).
+- `findings.md` — research notes. `TODO.txt` — open tasks.
 - `examples/example_pcgym.py` — original CSTR + PPO + PID reference (standalone).
 - `requirements.txt` — dependencies (see above).
 
 ### Output layout
-- `outputs/models/<scenario>/<run_label>[/seed<k>]/` — `best.pt` (best-evaluating; `per_seed_dir`
-  adds the `seed<k>` leaf for multi-seed runs) + `run.json` (the `RunSpec`) + `training_log.npz`
-  (+ `takeover.png`/`.npz` for shadow runs). Snapshots `epN.pt` only if `checkpoint_freq > 0`
-  (default 0).
-- `outputs/rollouts/<scenario>/<timestamp>/` — `run_rollouts` output: one `.npz` per method
-  (`<run_label>__seed<k>.npz`, `pid.npz`, `nmpc_oracle.npz`) + `manifest.json` with structured
+- `outputs/models/<scenario>/<run_label>[/seed<k>]/` — `best.pt` + `run.json` (the `RunSpec`) +
+  `training_log.npz` (mode-specific curve) + `dataset.npz` (offline modes) + `snapshots/`
+  (periodic weights-only `snap_<phase>_<step>.pt` + `snapshots.json`, for the takeover-map viz) +
+  `takeover_maps/` (generated by `analysis.plot_takeover_map`). Run-label slugs:
+  `offline_ddpg_bc` (primary), `offline_td3_bc`, `o2o_ddpg`, `online_ddpg`.
+- `outputs/rollouts/<scenario>/<timestamp>/` — `deploy.run_rollouts` output: `pid.npz`, `nmpc.npz`,
+  and `<stem>__<stage>[_m<margin>].npz` per model×stage + `manifest.json` with structured
   `MethodRecord`s. Raw per-step rollouts for the Phase-4 analysis utility.
 - `outputs/experiments/<grid>/provenance.json` — resolved grid + git commit + library versions.
-- `outputs/runs/`, `outputs/analysis/`, `runs/` — stale artifacts from the removed plotting
-  subsystem / pre-refactor runs. Not written by current code.
+- `outputs/cache/datasets/` — cached offline datasets keyed by (scenario, seed, expert,
+  episodes, perturb), so offline + o2o conditions at one seed share a dataset instead of each
+  re-running the expert. `outputs/cache/mpc_grids/` — cached MPC action-grids per (scenario,
+  slice, sp, horizon, grid_res) so takeover maps don't recompute the same IPOPT solves. Both
+  are pure caches — safe to delete; they just avoid re-running NMPC.
+- `outputs/runs/`, `outputs/analysis/`, `runs/` — stale pre-reframe artifacts. Not written by current code.
 
 ### Typical workflow (programmatic — no CLI)
 ```python
 from experiments import GRIDS
-from run_experiments import run_grid, override_grid
+from pipeline import run_pipeline, override_grid
 from schema import Device
 
-grid = GRIDS["phase1_cstr_fourtank"]                       # envs × conditions × seeds
-grid = override_grid(grid, env_names=["cstr"], seeds=[0,1], steps=5000)  # smaller smoke grid
-run_grid(grid, device=Device.CPU)                          # train + rollouts + provenance
-# Phase-4 analysis utility (metrics/figures from the rollout .npz + training_log.npz): TO BE BUILT
+grid = GRIDS["phase1_offline"]                             # envs × conditions × seeds
+grid = override_grid(grid, env_names=["cstr"], seeds=[0,1],
+                     offline_steps=5_000, online_steps=2_000)  # smaller smoke grid
+run_pipeline(grid, device=Device.CPU)                      # dataset → pretrain → staged rollouts
+from analysis import analyse_rollout_dir, latest_rollout_dir
+analyse_rollout_dir(latest_rollout_dir("cstr"))            # metrics_summary.csv + figures
 ```
+Or in one shot: `run_pipeline(grid)` now runs dataset → pretrain → rollouts → **analysis**.
 
 ## Metrics
 Target metric set for evaluating each method across seeds:
@@ -255,20 +279,20 @@ Target metric set for evaluating each method across seeds:
 
 ## Metrics Pipeline (current state)
 Decoupled run → store → (rebuild) analyse:
-- **Evaluation side (built).** `evaluate.run_rollouts()` writes raw per-step rollouts incl.
-  `violations` (from `env.state` vs `constraint_spec`) and `q_gap`, with structured `MethodRecord`
-  metadata. (Phase 2 ✅)
-- **Training side (built).** `train_model` serialises a per-run `training_log.npz` (behaviour
-  return + violation count/rate/max + takeover per episode; deterministic eval return + takeover
-  per boundary) + `run.json`. (Phase 2 ✅)
-- **Orchestration (built).** `run_experiments.run_grid()` loops conditions × seeds × envs
-  (resumable, provenance, failure-isolated). (Phase 3 ✅)
-- **Plotting / metrics utility (MISSING — the main build, Phase 4).** A new `analysis.py` should
-  load the rollout `.npz` + `manifest.json` + per-run `training_log.npz` and emit metric tables
-  (CSV) + figures (PNG): control (IAE/ISE, overshoot, settling, offset, median+MAD return), safety
-  (C1), optimality gap (C2), learning curves, takeover analysis (C3), and `rliable` robust stats.
-  See `dissertation_plan.md` Phase 4 and the "Removed subsystem" note below for the user's learned
-  plot preferences.
+- **Deployment side (built).** `deploy.run_rollouts()` writes raw per-stage rollouts incl.
+  `violations`, `q_gap`, `divergence`, with structured `MethodRecord` metadata. (✅)
+- **Training side (built).** `pretrain` serialises a mode-specific `training_log.npz` (offline:
+  grad-step eval curve; o2o/online: behaviour-time return/violation/takeover) + `run.json`. (✅)
+- **Orchestration (built).** `pipeline.run_pipeline()` loops conditions × seeds × envs through
+  dataset → pretrain → staged rollouts → analysis (resumable, provenance, failure-isolated). (✅)
+- **Plotting / metrics utility (built — Phase 4 ✅).** `analysis.py` loads a rollout dir
+  (`.npz` + `manifest.json`) and emits `metrics_summary.csv` (control: IAE/ISE, overshoot,
+  settling, offset, median+MAD return; safety: violation rate/count/max/first-step; optimality:
+  normalized score [PID=0, NMPC=1] with `rliable` IQM+CI; takeover; divergence; control effort)
+  plus figures (trajectories, return bar, normalized score, safety, takeover, return box).
+  `plot_training_curve(run_dir)` renders the learning curve. Model runs are aggregated across
+  seeds by (condition × stage); identity comes from `MethodRecord`, never the filename.
+  `pipeline.run_pipeline(stage=Stage.ANALYSE)` runs it standalone.
 
 ## Removed: training-metrics & plotting subsystem (historical reference)
 Deleted 2026-06-05 ("this isn't working… we can do better"); the model layer was then further
@@ -285,20 +309,19 @@ live in `dissertation_plan.md`. Key user preferences to preserve when rebuilding
 - Quantify **stability + sample efficiency** specifically, comparing shadow vs same-core standard.
 
 ## Coding Conventions
-- Add new environments to the `SCENARIOS` registry in `scenarios.py`; add new models to
-  `models.py`; add new experiment grids/conditions to `experiments.py` (`GRIDS`, `Condition`).
-  Keep the training loop in `train.py:train_model`.
-- Reuse `run_episode` from `evaluate.py` rather than re-implementing rollouts/loops.
-- **Typed metadata, no slugs.** New run/method metadata goes in `schema.py` dataclasses
-  serialised to JSON; categorical values are StrEnums; type-hint everything. Never derive a run's
-  identity by parsing a directory/file name — read the `RunSpec`/`MethodRecord`.
-- **No CLIs.** Modules are libraries invoked programmatically (e.g. `run_experiments.run_grid`).
-  Don't re-add argparse unless explicitly asked.
-- **One backend.** All agents share the custom DDPG/TD3 core. Standard vs shadow is the fair
-  ablation (`DDPG`/`TD3` vs `ShadowDDPG`/`ShadowTD3` — identical learner, switching off). Don't
-  reintroduce SB3 unless explicitly asked.
-- Use `env.state` (not `obs`) for physical state values when plotting/logging.
-- Use `seed=` in `env.reset()` for reproducibility; training seeds episodes as
-  `episode + seed * 10_000`.
+- **Do NOT modify `scenarios.py` or `constraints.py`** — they are fixed (verbatim PC-Gym +
+  calibrated constraints). Add new models to `models.py`, new grids/conditions to
+  `experiments.py`. Keep training in `pretrain.py`, rollouts in `deploy.py`.
+- Reuse `deploy._record_episode` / `evaluate_deploy` rather than re-implementing rollout loops.
+- **Typed metadata, no slugs.** New run/method metadata goes in `schema.py` dataclasses serialised
+  to JSON; categorical values are StrEnums; type-hint everything. Never parse identity from a
+  filename — read the `RunSpec`/`MethodRecord`.
+- **No CLIs.** Modules are libraries invoked programmatically (e.g. `pipeline.run_pipeline`).
+- **One backend.** All agents share the custom TD3/DDPG core; `bc_alpha` toggles TD3+BC vs plain.
+  No SB3 unless explicitly asked.
+- **Offline ≠ online.** The headline method pretrains from a STATIC dataset (no env interaction).
+  Online phases (o2o fine-tune, online contrast) are explicit and expert-guarded / clearly labelled.
+- Use `env.state` (not `obs`) for physical state values when logging.
+- Use `seed=` in `env.reset()`; training seeds episodes as `episode + seed * 10_000`.
 - Prefer numpy over torch for non-NN computations.
-- Use `do_mpc` + `casadi` for the NMPC oracle baseline (`models.NMPCController`).
+- The NMPC (`models.NMPCController`, do-mpc + casadi) is the MPC expert AND optimality ceiling.

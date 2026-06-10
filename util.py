@@ -16,16 +16,16 @@ def configure_utf8_output() -> None:
             pass
 
 
-def resolve_device(device: str = "gpu") -> torch.device:
+def resolve_device(device: str = "auto") -> torch.device:
     """
     Return the compute device to use for training/inference.
-    Pass "gpu"/"cuda" to use the CUDA GPU when available; anything else (or no GPU)
-    falls back to CPU.
+      "cpu"                 -> always CPU
+      "auto"/"gpu"/"cuda"   -> CUDA GPU when available, else CPU
+    Default "auto" so a GPU box is used without having to ask for it.
     """
-    if device in ("gpu", "cuda") and torch.cuda.is_available():
-        return torch.device("cuda")
-    else:
+    if str(device).lower() == "cpu":
         return torch.device("cpu")
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 def device_label(device: torch.device) -> str:

@@ -211,3 +211,7 @@ runs/
 outputs/
 learn/
 refs/
+outputs_cachetest/
+PROGRAM_OVERVIEW.md
+CODEBASE_GUIDE.md
+tee.py

@@ -1,284 +1,152 @@
-# Dissertation Plan — Demonstrating Shadow Mode RL on PC-Gym
+# Dissertation Plan — Offline RL for Industrial Process Control
 
-**Goal:** Show, with academic rigour, that Shadow Mode RL (Gassert & Althoff, 2024)
-"works" on real-ish chemical-process-control environments (PC-Gym), as the empirical
-core of the FYP on *making RL reliable enough for industrial process control via
-hard constraint satisfaction*.
-
-The central difficulty is that **"shadow mode works" is not a falsifiable claim.**
-This plan decomposes it into testable sub-claims, defines the experiments and statistics
-that would convince a skeptical examiner, and lists the concrete codebase work needed.
-
----
-
-## 1. Turn "it works" into falsifiable claims
-
-| # | Claim | Why it matters | Primary evidence |
-|---|-------|----------------|------------------|
-| C1 | **Safety during training.** Shadow mode incurs far fewer constraint violations / catastrophic actions *while learning on the system* than standard RL. | The unique selling point. In a simulator, everything else is obtainable by training offline — only training-time safety justifies the method. | Cumulative violations vs training step (behaviour policy), shadow vs pure. |
-| C2 | **No performance sacrifice.** The deployed greedy combined policy matches/beats standard RL at equal env-step budget, and beats the baseline controller. | Shadow must not cost final performance, or the safety is worthless. | Deployed return, IAE/ISE, optimality gap vs NMPC oracle. |
-| C3 | **Selective, earned takeover.** The agent takes control where it is genuinely better (transients, setpoint changes) and defers where the baseline is good. | Shows the *mechanism* behaves as theorised, not randomly. | Takeover fraction over training + over state/episode regions. |
-| C4 | **Reliability.** Low across-seed variance; graceful degradation under noise / disturbance / unseen setpoints; no catastrophic collapses. | This is literally the thesis premise (reliability). | Robust dispersion stats, stress tests. |
-
-C2 is *necessary*; C1, C3, C4 are what make the method *interesting*. The headline
-result is **C1 + C2 together**: safety-during-training at no performance cost.
+> **Reframed (2026-06) to match `project_proposal.md`.** The earlier plan described
+> Gassert & Althoff's *online* shadow-mode method (the agent explores on the live
+> plant during training). That contradicts the proposal, which is explicitly
+> **offline**: the RL controller is *pretrained on historical and simulated process
+> data*, then introduced alongside an established expert (MPC) in **shadow mode**,
+> graduating to autonomy only as confidence is earned. This document is the
+> authoritative roadmap for that offline pipeline.
 
 ---
 
-## 2. Comparison set (control conditions)
+## 1. The problem and the thesis
 
-For every environment × seed, run the same conditions. Shadow-vs-standard must be a
-**fair ablation**: identical core, hyperparameters, seeds, exploration noise, and
-**equal env-step budget** — differing *only* in the switching decision. The codebase is
-already built for this (one shared `_ShadowModel` core).
+RL could improve efficiency and adaptability in process control, but it is almost
+never deployed in safety-critical chemical plants for one reason: **learning
+requires trial-and-error exploration, and random actions on a live plant damage
+equipment, violate constraints, and ruin product.** Operators must be able to
+trust the controller *from the very first action*, including during learning.
 
-| Condition | Role | Code entry point |
-|-----------|------|------------------|
-| PID / PI baseline | safety-net floor | `scenarios.py` `baseline_cls` |
-| NMPC oracle | best-achievable ceiling (optimality gap) | `models.NMPCController` |
-| **Standard RL** (Pure DDPG / TD3) | the key ablation | `models.DDPG` / `models.TD3` |
-| **Shadow RL (q-value)** | the paper's method | `models.ShadowDDPG` qvalue |
-| Shadow ablations | agent-decision, reg, TD3 switch-critic | `--mode agent`, `--lambda-reg`, `--switch-critic` |
+The expert (an MPC, PID, or operator heuristic) is **established but suboptimal**,
+and is expensive to maintain (it needs an accurate, continually re-identified
+plant model). The thesis:
 
-Normalise each environment's scores to `[PID = 0, NMPC oracle = 1]` so results can be
-**aggregated across the PC-Gym suite** into a single suite-level claim.
+> An RL controller can be **pretrained offline** on logged/simulated data — never
+> touching the plant during learning — and then **introduced gradually alongside
+> the expert**, taking control only where it has *earned* it, until it can operate
+> on its own at least as well as the expert. This delivers RL's upside (model-free
+> adaptation, cheap inference, improvement on a suboptimal expert) with **no unsafe
+> learning phase**.
 
----
+The expert is a **safety scaffold and a performance floor**, not a competitor. The
+NMPC oracle (perfect model + online optimisation) is the **optimality ceiling** we
+measure the gap to — not something the agent must beat.
 
-## 3. Headline experiment — safety *during* training (C1)
-
-This is the experiment that actually proves the point and the one most projects omit.
-Measure cumulative harm incurred by the **behaviour policy** (what actually ran on the
-"plant") as a function of training steps, for Shadow vs Pure:
-
-- per-step **constraint-violation rate, count, max magnitude, time-to-recovery**;
-- **cumulative training cost / regret** (area between behaviour return and baseline / oracle);
-- number of **catastrophic episodes**.
-
-**Expected result:** Pure RL accumulates violations early (random exploration on the live
-plant); Shadow stays near-zero (the baseline catches dangerous proposals) — *at no cost to
-final performance* (C2).
-
-**Prerequisite (not yet in the codebase):**
-1. Add a `constraints` block to each scenario (`scenarios.py`). PC-Gym supports this
-   natively via `env_params["constraints"]`, `env_params["cons_type"]` (`"<="` / `">="`),
-   and `env_params["done_on_cons_vio"]`; per-step absolute violation magnitudes are
-   returned in `info["cons_info"]` (shape `[n_con, N, 1]`).
-2. **Log behaviour-time metrics during training** (violations + behaviour return), not just
-   the deterministic eval. The training-metrics subsystem was removed, so this needs a
-   lightweight re-add. Without it, C1/C3/C4 cannot be measured.
+### Three axes, kept distinct
+- **offline vs online** — the agent learns from a *fixed dataset*, with no env
+  interaction, during pretraining. (Optional conservative fine-tuning later is
+  *expert-guarded* online, not free exploration.)
+- **sim vs real** — PC-Gym is the *stand-in for the real plant*. Training online
+  *in sim* would still be "online"; we deliberately do not.
+- **model-free vs model-based** — the RL *learner* uses no dynamics model; the NMPC
+  expert/oracle does. The model-free benefit shows as the agent approaching NMPC
+  performance using only logged transitions.
 
 ---
 
-## 4. Supporting experiments
+## 2. The pipeline (what the program does)
 
-- **Sample efficiency / learning curves (C2).** Deterministic eval every ~1000 steps,
-  ≥10 seeds; plot **median + IQR band**. Report steps-to-threshold, area-under-curve,
-  asymptotic reward. Tests the guided-exploration / jump-start benefit.
-- **Final performance + optimality gap (C2).** Cross-seed deployed return, IAE/ISE per
-  controlled output, overshoot / settling time / steady-state offset per setpoint segment,
-  and **Δ = J(NMPC) − J(π)**. Plot PID, Pure, Shadow, oracle on one axis.
-- **Takeover / mechanism analysis (C3).** Takeover fraction over training (the
-  down-then-recover curve the paper predicts for q-value switching), and at convergence
-  *where* it takes over — bucketed by episode phase (transient vs steady-state) and by
-  proximity to setpoint changes. Correlate takeover with `Q(agent) − Q(baseline)` and with
-  realised advantage. This is the analogue of the paper's "agent favoured behind the
-  obstacle" figure.
-- **Robustness (C4).** Sweep noise level, unseen setpoint schedules, perturbed initial
-  conditions, disturbances; report worst-case / dispersion, not just the mean.
+```
+   ┌─────────────┐   ┌──────────────┐   ┌────────────────────────────────┐
+   │ 1. DATASET  │ → │ 2. OFFLINE   │ → │ 3. STAGED DEPLOYMENT            │
+   │ expert +    │   │  PRETRAIN    │   │  shadow (earned takeover) → auto │
+   │ perturb.    │   │  (TD3+BC)    │   │  (+ optional o2o fine-tune)     │
+   └─────────────┘   └──────────────┘   └────────────────────────────────┘
+```
 
----
-
-## 5. Ablations (what actually matters)
-
-- switching **on/off** (Shadow vs Pure) — the core ablation;
-- **q-value vs agent-decision** switching;
-- **baseline quality**: well-tuned PID vs detuned PID vs CIRL (RQ2) — does shadow still
-  help with a weak baseline, and does a stronger baseline raise the floor?;
-- **randomised start on/off** (the paper shows it matters — reproduce);
-- **λ sweep** for agent-mode reward regularisation (Eq. 5);
-- (RQ3) uncertainty-aware switching, if implemented.
-
----
-
-## 6. Statistical rigour
-
-This is where projects gain or lose marks.
-
-- **≥10 seeds, ideally 20+.** PC-Gym episodes are cheap; few-seed results are not credible.
-- **Robust statistics, not mean ± std.** RL returns are heavy-tailed — report
-  **median + IQR / MAD** and the full distribution.
-- **Use `rliable`** (Agarwal et al., 2021): interquartile mean (IQM), stratified-bootstrap
-  confidence intervals, performance profiles, and **probability of improvement**
-  P(Shadow > Pure). Citing it signals awareness of RL-evaluation pitfalls.
-- **Non-parametric tests + effect sizes** (Mann–Whitney U / Wilcoxon) rather than t-tests
-  on a handful of non-normal samples.
-- **Aggregate across environments** with the normalised `[PID=0, oracle=1]` scores.
+1. **Dataset** (`data.py`) — log the expert (MPC/PID) operating the simulated
+   process, with action perturbations for coverage. This is the "historical and
+   simulated process data". Static; built once.
+2. **Offline pretrain** (`pretrain.py`) — **DDPG+BC** (the PRIMARY model;
+   behaviour-cloning-regularised DDPG, after Fujimoto & Gu 2021, and the algorithm
+   Gassert & Althoff's shadow-mode paper uses), with **TD3+BC** kept as a robustness
+   comparison. Trained purely from the static buffer. No env interaction.
+3. **Staged deployment** (`deploy.py`) — introduce the agent alongside the expert:
+   - **shadow** (headline) — the agent takes control wherever it has *earned* it,
+     `Q(s,a_agent) − Q(s,a_expert) > margin`; the expert handles the rest. A smaller
+     margin grants more authority.
+   - **autonomous** — agent controls alone (expert as optional hard safety fallback).
+   - **offline→online (optional)** — conservative fine-tuning from expert-guarded
+     transitions across these stages (low exploration; the expert catches un-earned
+     actions, so training-time safety is preserved).
+4. **Naive online contrast** — a standard online RL run on the live plant (full
+   exploration, no guard) whose high training-time violations are the **foil** that
+   motivates the offline approach.
 
 ---
 
-## 7. Threats to validity (pre-empt these in the viva)
+## 3. Falsifiable claims
 
-- **Strawman baselines.** Tune the PID reasonably *and* tune the standard-RL baseline at
-  least as hard as Shadow. Don't beat a crippled competitor.
-- **Equal budget.** Same total env steps for Shadow and Pure; shadow "wastes" steps on
-  baseline execution and that must count against it.
-- **No reading off training curves.** Report deployed greedy performance for "how good";
-  use the dense behaviour curve only for learning-process / safety claims.
-- **Generality.** ≥3 of the 4 PC-Gym environments, with different dynamics / timescales.
-- **Reproducibility.** Fixed seeds, all hyperparameters in a config, pre-declare the
-  steps-to-threshold cutoff so it cannot be cherry-picked. Record compute.
+| | Claim | Why it matters | Evidence |
+|---|---|---|---|
+| **C1** | **Offline learnability.** The agent, trained *only* on the static expert dataset, matches/approaches the expert at deployment — with **zero plant interaction during learning**. | The core feasibility claim: you can learn a competent controller without risky exploration. | Offline learning curve (`training_log.npz`); autonomous deployment return vs expert. |
+| **C2** | **Safe introduction.** In shadow deployment, constraint violations stay near expert levels and far below the naive online contrast; takeover is **earned** (only where Q-gap > margin). | Safety during introduction is the whole point. | Shadow violation rate (`deploy` rollouts); training-time violation curve, offline/o2o **vs** online contrast (C1 foil). |
+| **C3** | **Graduated autonomy.** As the margin relaxes / fine-tuning proceeds, agent takeover fraction rises while performance is maintained or improved and safety preserved. | The "gradually increasing autonomy" of the proposal. | Takeover fraction vs margin/step; return & violations per margin; Q-gap distributions. |
+| **C4** | **Standalone autonomy + reliability.** The agent eventually operates *alone*, matching/beating the expert and within X% of the NMPC optimum, with bounded violations, consistently across seeds. | "...with the ultimate goal of the model operating on its own." | Autonomous return, IAE/ISE, optimality gap vs NMPC; robust cross-seed stats (median/MAD, `rliable`). |
 
 ---
 
-## 8. The defensible thesis sentence
+## 4. Comparison set
 
-Aim to be able to write, with statistics behind every clause:
+Per scenario, recorded by `deploy.run_rollouts`:
+- **PID baseline** — the cheap reference floor.
+- **NMPC** — the expert (setpoint-tracking scenarios) **and** the optimality ceiling.
+- **Offline DDPG+BC** (primary) and **Offline TD3+BC** (robustness comparison) —
+  each deployed at the shadow (MPC-guarded) and autonomous (normal) stages.
+- **O2O DDPG** — offline + conservative expert-guarded fine-tuning.
+- **Online DDPG (contrast)** — the unsafe foil (plain online DDPG, no MPC, no BC).
 
-> *Across N PC-Gym environments and M seeds, shadow-mode DDPG matched standard DDPG's
-> deployed control performance (within X% of the NMPC optimum) while reducing constraint
-> violations incurred during on-system training by Y× (stratified-bootstrap 95% CI …),
-> with takeover concentrated in setpoint transients — demonstrating that the safety net
-> does not cost final performance.*
+Expert per scenario (`experts.py`): **NMPC** for `cstr`, `four_tank`,
+`multistage_extraction`; **PID** for `crystallization` (delta-u → NMPC N/A).
 
----
-
-## 9. References
-
-**Core method & benchmark**
-- Gassert, P. & Althoff, M. (2024). *Stepping Out of the Shadows: Reinforcement Learning in
-  Shadow Mode.* arXiv:2410.23419 — https://arxiv.org/abs/2410.23419
-- Bloor, M. et al. (2024). *PC-Gym: Benchmark Environments for Process Control Problems.*
-  arXiv:2410.22093 — https://arxiv.org/abs/2410.22093
-- Bloor, M. et al. (2024). *Control-Informed Reinforcement Learning for Chemical Processes
-  (CIRL).* arXiv:2408.13566 — https://arxiv.org/abs/2408.13566
-- Bloor, M. et al. (2025). *A Survey and Tutorial of Reinforcement Learning Methods in
-  Process Systems Engineering.* arXiv:2510.24272 — https://arxiv.org/abs/2510.24272
-- Joshi, S., Parbhoo, S. & Doshi-Velez, F. (2022). *Learning-to-Defer for Sequential Medical
-  Decision-Making under Uncertainty (SLTD).* arXiv:2109.06312 — https://arxiv.org/abs/2109.06312
-
-**RL algorithms**
-- Lillicrap, T. et al. (2015). *Continuous Control with Deep Reinforcement Learning (DDPG).*
-  arXiv:1509.02971 — https://arxiv.org/abs/1509.02971
-- Fujimoto, S., van Hoof, H. & Meger, D. (2018). *Addressing Function Approximation Error in
-  Actor-Critic Methods (TD3).* arXiv:1802.09477 — https://arxiv.org/abs/1802.09477
-
-**Evaluation methodology**
-- Agarwal, R. et al. (2021). *Deep Reinforcement Learning at the Edge of the Statistical
-  Precipice (rliable).* NeurIPS. arXiv:2108.13264 — https://arxiv.org/abs/2108.13264
-
-**Safe RL context**
-- García, J. & Fernández, F. (2015). *A Comprehensive Survey on Safe Reinforcement Learning.*
-  JMLR 16. — https://jmlr.org/papers/v16/garcia15a.html
-- Dalal, G. et al. (2018). *Safe Exploration in Continuous Action Spaces.* arXiv:1801.08757
-  — https://arxiv.org/abs/1801.08757
-- Wabersich, K.P. & Zeilinger, M.N. (2021). *A Predictive Safety Filter for Learning-Based
-  Control.* Automatica 129. — https://doi.org/10.1016/j.automatica.2021.109639
-- Brunke, L. et al. (2022). *Safe Learning in Robotics.* Annual Review of Control, Robotics,
-  and Autonomous Systems 5. — https://doi.org/10.1146/annurev-control-042920-020211
+Normalise scores `[PID = 0, NMPC = 1]` for cross-environment aggregation; robust
+stats (median + MAD/IQR, `rliable` IQM + bootstrap CIs, P(offline > expert)).
 
 ---
 
-## 10. Codebase readiness assessment
+## 5. Metrics
 
-| Component | Status | Work needed |
-|-----------|--------|-------------|
-| Scenarios / 4 PC-Gym envs (`scenarios.py`) | ✅ Ready | Constraints DONE — native `constraints`/`cons_type`/`done_on_cons_vio`/`r_penalty` + mirrored `constraint_spec` on all four (cstr verbatim; four_tank/multistage/cryst physically-motivated, see `constraints_rationale.md`). |
-| Models: Pure/Shadow DDPG·TD3, qvalue + agent, reg, switch-critic (`models.py`) | ✅ Ready & paper-faithful (after recent fixes) | None for core experiments. `q_gap()` added for takeover-vs-advantage (C3). |
-| NMPC oracle (`models.NMPCController`) | ✅ Ready | None (setpoint-tracking only). NOTE: it's a *performance* ceiling, NOT a safety oracle — nominal MPC rides the constraint boundary so it violates under noise (see Phase-2 finding). |
-| Save / load + run-label dirs | ✅ Ready | None. |
-| Training loop (`train.py`) | ✅ Ready | Behaviour-time logger DONE — `training_log.npz` per run (behaviour return + violation count/rate/max + takeover per episode; deterministic eval return + takeover per boundary). |
-| Rollout recorder (`evaluate.run_rollouts`) | ✅ Ready | Per-step `violations` array DONE (computed from `env.state` vs `constraint_spec`, in every `.npz` + manifest). `q_gap` recorded too. |
-| Multi-seed / multi-condition orchestration | ✅ Ready | `run_experiments.py` executes a grid (train → rollouts), resumable + provenance. Metadata is structured (StrEnums + `schema.py` dataclasses → `run.json` / manifest `MethodRecord`s), never slug-derived. |
-| Metrics / analysis utility (`analysis.py`) | ✅ Built | Typed loaders (rollouts + run.json + training_log); control (return median+MAD, IAE/ISE, offset, overshoot, settling-time); safety (deployment rate/count/max + time-to-recovery + C1 cumulative); optimality gap [PID=0,oracle=1]; learning curves + steps-to-threshold + AUC; C3 takeover over training + transient-vs-steady bucketing; trajectory overlays (tracking + constrained-variable). CSV (18 cols) + claim-tagged PNGs. Metric fns unit-tested. |
-| Robust statistics (`rliable`) | ✅ Wired | `analysis.aggregate_scenarios` → IQM + 95% bootstrap CI (`iqm_with_ci`) + `prob_improvement` (P(Shadow>Pure)). |
-
-**Summary:** the *learning* machinery AND the *capture* machinery (constraints, behaviour-time
-logging, rollout violations) are done. Remaining gaps are **orchestration** (Phase 3) and the
-**analysis/metrics utility** (Phase 4, the main build).
+- **Control/tracking**: median return + MAD across seeds; IAE/ISE per output;
+  overshoot, settling time, steady-state offset per setpoint segment.
+- **Safety**: violation rate/count/max magnitude, time-to-recovery — **per stage**
+  and **per training step** (offline/o2o vs online contrast).
+- **Introduction-specific**: takeover fraction (per stage, over fine-tuning),
+  divergence `‖a_agent − a_expert‖`, Δ-vs-expert return, Q-gap distribution.
+- **Offline-learning**: asymptotic offline return, gradient-steps-to-threshold.
+- **Optimality gap**: Δ = J(NMPC) − J(agent), normalised `[PID=0, NMPC=1]`.
 
 ---
 
-## TODO
+## 6. Status & TODO
 
-Scoped to be completable **by tomorrow with Claude's help**. Ordered so that if we run out
-of time, the headline claim (C1 + C2) is still covered. `[core]` = required for the headline
-result; `[stretch]` = strengthens the thesis if time allows.
+**Built (Phases 1–4):**
+- [x] Scenarios + constraints (`scenarios.py`, `constraints.py`) — unchanged, verbatim PC-Gym.
+- [x] Expert factory (`experts.py`) — NMPC where supported, PID fallback.
+- [x] Offline dataset generation (`data.py`).
+- [x] Offline agents TD3+BC / DDPG+BC + staged `ShadowController` (`models.py`).
+- [x] Training: offline, offline→online, online contrast (`pretrain.py`).
+- [x] Staged deployment + raw rollout serialisation (`deploy.py`).
+- [x] Orchestration: grids + resumable runner + provenance (`experiments.py`, `pipeline.py`).
+- [x] **Analysis utility (`analysis.py`)** — rollout dir → `metrics_summary.csv`
+      (control IAE/ISE/overshoot/settling/offset/median+MAD; safety rate/count/max;
+      optimality normalized score + `rliable` IQM/CI; takeover; divergence; effort)
+      + figures (trajectories, return, normalized score, safety, takeover, box) +
+      `plot_training_curve`. Decoupled run→store→analyse; robust stats; aggregates
+      models across seeds by (condition × stage). Auto-run by `run_pipeline`.
 
-### Phase 0 — Setup (≈15 min)  ✅ DONE
-- [x] `[core]` `pip install rliable` into `.venv`; confirm import. (installed)
-- [x] `[core]` Fix the experiment grid for the first pass: envs = {`cstr`, `four_tank`},
-      conditions = {PID, NMPC oracle, Pure DDPG, Shadow DDPG qvalue}, seeds = 5 (scale to
-      10+ later), budget = 50k steps (CSTR) for a complete pipeline run, then scale.
-- [x] `[core]` Create config (envs, conditions, seeds, steps) so runs are reproducible.
-      (`experiments.py` — declarative grids + provenance.)
+**Remaining / next:**
+- [ ] Scale seeds (5–10) and run all four scenarios; pick scenarios where the
+      standalone agent is reckless vs the expert so the C2 *safety* benefit shows.
+- [ ] Per-setpoint-segment tables and cross-environment aggregate score figure.
 
-### Phase 1 — Constraints (`scenarios.py`)  ✅ DONE
-- [x] `[core]` Add `constraints`, `cons_type`, `done_on_cons_vio=False` to `cstr` (reactor
-      temperature 321–327 K, VERBATIM from PC-Gym) and `four_tank` (h3/h4 overflow ≤ 0.6 m).
-- [x] `[core]` Verify `env.step` populates `info["cons_info"]` and that the NMPC oracle still
-      builds (it reads `env_params["constraints"]`). Verified.
-- [x] `[stretch]` Add constraints to `crystallization` (Conc ≥ 0.11) and `multistage_extraction`
-      (X5 ≤ 0.5). All four physically justified in `constraints_rationale.md`.
+---
 
-### Phase 2 — Capture safety + behaviour-time metrics (`evaluate.py` + `train.py`)  ✅ DONE
-- [x] `[core]` Record a per-step `violations` array into each `<method>.npz` (computed from
-      `env.state` vs `constraint_spec` — cleaner than PC-Gym's `cons_info`, which leaks across
-      episodes); documented in the manifest `array_schema`.
-- [x] `[core]` Behaviour-time logger in the training loop → `training_log.npz` per run
-      (behaviour return + violation count/rate/max + takeover per episode; deterministic eval
-      return + takeover per boundary; JSON meta with the constraint spec). Written for EVERY run.
-- [x] `[stretch]` Record `Q(agent) − Q(baseline)` per rollout step (`q_gap`) for the
-      takeover-vs-advantage analysis (C3). Verified: +adv when agent acts, −adv when it defers.
-
-### Phase 3 — Orchestration (`run_experiments.py`)  ✅ DONE
-- [x] `[core]` Executor that loops conditions × seeds × envs, calling the existing `train()`
-      then `run_rollouts()`; outputs under `outputs/models|rollouts|experiments/`. Resumable
-      (skips existing checkpoints) + `write_provenance()` (grid + git + lib versions).
-- [x] `[core]` CLI `--grid --envs --seeds --steps --stage --device --dry-run --force`; runs in
-      the background fine (Phase-2 logger persists incrementally).
-- [x] `[core]` **Design compliance**: run metadata lives in typed objects — `schema.py`
-      StrEnums (`Scenario`, `MethodRole`, `Device`) + dataclasses (`RunSpec`, `ModelSpec`,
-      `MethodRecord`) serialised to `run.json` (per checkpoint) and the rollout manifest /
-      self-describing `.npz` `meta`. Identity is NEVER parsed from a directory slug; slugs only
-      *locate* files. `evaluate.run_rollouts` now takes `list[ModelSpec]` (no `parent.name`).
-
-### Phase 4 — Metrics / analysis utility (`analysis.py`)  ✅ CORE DONE
-- [x] `[core]` Typed loaders: rollout `*.npz` + `manifest.json` (`MethodRecord`) + per-run
-      `run.json` (`RunSpec`) + `training_log.npz` (`RolloutArrays` / `TrainingArrays` dataclasses).
-- [x] `[core]` **Control metrics**: median + MAD deployed return, IAE/ISE per output, steady-state
-      offset, overshoot, and settling-time per setpoint segment.
-- [x] `[core]` **Safety (C1)**: deployment violation rate/count/max (reuse `constraint_metrics`) +
-      time-to-recovery; cumulative training-time violations vs step (Shadow vs Pure) figure.
-- [x] `[core]` **Optimality gap (C2)**: Δ = J(NMPC) − J(π), normalised `[PID=0, oracle=1]`
-      (handles the no-oracle scenario gracefully).
-- [x] `[core]` **Learning curves**: deterministic eval median + IQR band; steps-to-threshold (vs
-      PID level) + AUC.
-- [x] `[core]` **Takeover (C3)**: deployment takeover fraction over training + transient-vs-steady
-      bucketing of deployment takeover (the "earned takeover" signal).
-- [x] `[core]` **Robust stats**: `aggregate_scenarios` → rliable IQM + stratified-bootstrap CI +
-      `prob_improvement` P(Shadow > Pure).
-- [x] `[core]` Emit **tables (CSV) + figures (PNG)**, claim-tagged (`c1_*`/`c2_*`/`c3_*`).
-- [x] `[stretch]` Overshoot/settling, time-to-recovery, steps-to-threshold/AUC, takeover
-      phase-bucketing, + trajectory-overlay figures (tracking + constrained variable). Metric
-      functions unit-tested against known answers.
-
-### Phase 5 — Run & generate results (≈1–2 h wall-clock, mostly background)
-- [ ] `[core]` Train all conditions × seeds for `cstr` (and `four_tank` if time), background jobs.
-- [ ] `[core]` Record rollouts (incl. PID + NMPC oracle) for every trained model.
-- [ ] `[core]` Run `analysis.py`; produce the C1 safety-during-training figure, the C2
-      learning-curve + optimality-gap figure/table, and the C3 takeover figure.
-- [ ] `[core]` Fill in the thesis sentence (§8) with the actual numbers.
-
-### Phase 6 — Ablations & stress tests (`[stretch]`, if time remains)
-- [ ] `[stretch]` Agent-decision vs q-value switching on `cstr`.
-- [ ] `[stretch]` Randomised-start on/off ablation (reproduce the paper's finding).
-- [ ] `[stretch]` Baseline-quality ablation (tuned vs detuned PID).
-- [ ] `[stretch]` Robustness sweep: noise level + unseen setpoint schedule.
-- [ ] `[stretch]` Scale seeds to 10–20 and re-run the headline figures.
-
-### Realistic outcome for "tomorrow"
-A complete, reproducible pipeline (constraints → training with safety logging →
-multi-seed orchestration → metrics/figures) plus a **first full result on CSTR** (5 seeds,
-4 conditions) covering C1 + C2 + C3, with `four_tank` and the ablations as immediate
-follow-ups. Scaling to more seeds/envs is then just compute time, not new code.
+## 7. Key references
+- **Shadow mode** — Gassert & Althoff (2024). *Stepping Out of the Shadows.*
+  (Switching idea; note: their method is online — we adapt the **switching/earned-
+  takeover** mechanism to an **offline-pretrained** agent per the proposal.)
+- **TD3+BC** — Fujimoto & Gu (2021). *A Minimalist Approach to Offline RL.*
+- **PC-Gym** — Bloor et al. (2024/2025). Benchmark environments.
+- **CIRL** — Bloor et al. (2024). PID-embedded RL for process control.
+- **Learning-to-defer / SLTD** — Joshi et al. (2022). Sequential deferral.

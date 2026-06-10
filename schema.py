@@ -1,24 +1,23 @@
 """
 schema.py
 =========
-The shared, typed vocabulary of the experiment pipeline. Run metadata lives in
-STRUCTURED, TYPED objects (StrEnums + dataclasses) serialised to JSON — never
-encoded into, nor parsed back out of, directory/file slugs. Slugs (run-label dir
-names) remain ONLY a human-readable convenience.
+The shared, typed vocabulary of the OFFLINE process-control pipeline. Run
+metadata lives in STRUCTURED, TYPED objects (StrEnums + dataclasses) serialised
+to JSON — never encoded into, nor parsed back out of, directory/file slugs.
 
 Sources of truth for a run's identity:
-  - Condition    : a learner configuration (algorithm + shadow settings), declared
-                   in experiments.py grids; produces both its train() kwargs and a
-                   RunSpec — so the two never drift.
-  - RunSpec      : a Condition bound to (scenario, seed, total_steps); written as
+  - Condition    : a learner configuration (algorithm + training mode + BC strength
+                   + expert), declared in experiments.py grids; produces both its
+                   pretraining kwargs and a RunSpec — so the two never drift.
+  - RunSpec      : a Condition bound to (scenario, seed, budgets); written as
                    run.json beside each checkpoint.
-  - ModelSpec    : the typed input to evaluate.run_rollouts (checkpoint + RunSpec).
-  - MethodRecord : one structured entry per method in a rollout manifest, consumed
-                   by the analysis utility (Phase 4) — which reads these fields and
-                   never inspects a filename.
+  - ModelSpec    : the typed input to deploy.run_rollouts (checkpoint + RunSpec).
+  - MethodRecord : one structured entry per method (and deployment stage) in a
+                   rollout manifest, consumed by the analysis utility — which reads
+                   these fields and never inspects a filename.
 
-StrEnum members are `str` subclasses; `_to_jsonable` converts them (and nested
-dataclasses) to plain JSON, and we parse them back explicitly on load.
+The pipeline (project_proposal.md):
+  offline pretrain  ->  shadow (earned takeover alongside the expert)  ->  autonomous
 """
 
 import enum
@@ -27,7 +26,7 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 import numpy as np
 
-from models import SwitchingMode, TD3SwitchCritic
+from models import AgentType, DeploymentStage
 
 
 # ---------------------------------------------------------------------------
@@ -42,91 +41,91 @@ class Scenario(enum.StrEnum):
     CRYSTALLIZATION = "crystallization"
 
 
-class Algorithm(enum.StrEnum):
-    """The off-policy learner family. Orthogonal to shadow-mode switching."""
-    DDPG = "ddpg"
-    TD3 = "td3"
+# Algorithm is an alias of the agent family defined in models.py.
+Algorithm = AgentType
+
+
+class TrainingMode(enum.StrEnum):
+    """
+    How an agent is produced:
+      offline           — pretrain purely on the static expert(+perturbed) dataset
+                          (no env interaction). The headline method.
+      offline_to_online — offline pretrain, then conservative fine-tuning from
+                          expert-GUARDED online transitions across the staged
+                          (shadow -> autonomous) deployment.
+      online_contrast   — naive online RL trained on the live plant from scratch
+                          (the unsafe foil the offline method is meant to avoid).
+    """
+    OFFLINE = "offline"
+    OFFLINE_TO_ONLINE = "offline_to_online"
+    ONLINE_CONTRAST = "online_contrast"
+
+
+class ExpertKind(enum.StrEnum):
+    """Which expert a scenario deploys the agent alongside."""
+    NMPC = "nmpc"   # do-mpc NMPC — setpoint-tracking scenarios
+    PID = "pid"     # PID/PI baseline — delta-u / disturbance scenarios (e.g. crystallization)
 
 
 class MethodRole(enum.StrEnum):
-    """Role a method plays in a rollout: a learned model, or a reference controller."""
-    MODEL = "model"
-    PID = "pid"
-    NMPC_ORACLE = "nmpc_oracle"
+    """Role a method plays in a rollout."""
+    MODEL = "model"          # a learned agent (at some DeploymentStage)
+    PID = "pid"              # PID/PI baseline controller
+    NMPC = "nmpc"            # NMPC (expert and/or optimality ceiling)
 
 
 class Device(enum.StrEnum):
+    AUTO = "auto"   # use the GPU when one is available, else CPU
     CPU = "cpu"
     GPU = "gpu"
 
 
 def _opt_enum(enum_cls: type[enum.StrEnum], value: Any) -> Any:
-    """Parse an optional StrEnum field from JSON (None/'' -> None)."""
     return enum_cls(value) if value else None
 
 
 def _json_factory(items: list[tuple[str, Any]]) -> dict[str, Any]:
-    """
-    `asdict` dict_factory that converts StrEnum values to their `.value`. asdict
-    already recurses nested dataclasses (applying this factory at each level), so a
-    single pass yields plain JSON — no separate re-walk, no json.dumps reliance.
-    """
     return {k: (v.value if isinstance(v, enum.Enum) else v) for k, v in items}
 
 
 # ---------------------------------------------------------------------------
-# Controller protocols (replace `object` for the heterogeneous rollout actors)
+# Controller protocols
 # ---------------------------------------------------------------------------
 
 @runtime_checkable
 class ReferenceController(Protocol):
-    """A non-learned controller (PID / NMPC oracle): predict() + optional reset()."""
+    """A non-learned controller (PID / NMPC): predict() + optional reset()."""
     def predict(self, obs: np.ndarray, deterministic: bool = True) -> tuple[np.ndarray, Any]: ...
 
 
 @runtime_checkable
-class ShadowAgent(Protocol):
-    """A learned shadow/standard agent: shadow-aware decision + q-value advantage."""
-    def decide_action(self, obs: np.ndarray, baseline_action: np.ndarray,
-                      training: bool = True, force_baseline: bool = False
-                      ) -> tuple[np.ndarray, bool, np.ndarray]: ...
-    def q_gap(self, obs: np.ndarray, baseline_action: np.ndarray) -> float: ...
-
-
-# A rollout actor is one or the other; _record_rollout dispatches on decide_action.
-RolloutController = ReferenceController | ShadowAgent
+class Agent(Protocol):
+    """A learned offline agent: deterministic action, switching-critic Q-gap."""
+    def act(self, obs: np.ndarray, explore: bool = False) -> np.ndarray: ...
+    def q_gap(self, obs: np.ndarray, expert_action: np.ndarray) -> float: ...
 
 
 # ---------------------------------------------------------------------------
 # Run-label (directory slug) — human-readable convenience ONLY
 # ---------------------------------------------------------------------------
 
-def run_label_for(
-    algorithm: Algorithm,
-    *,
-    shadow: bool = False,
-    mode: SwitchingMode = SwitchingMode.Q_VALUE,
-    lambda_reg: float = 0.0,
-    switch_critic: TD3SwitchCritic = TD3SwitchCritic.Q1,
-) -> str:
+def run_label_for(algorithm: Algorithm, mode: TrainingMode, bc: bool) -> str:
     """
     Canonical output-directory name for a training condition — the SINGLE source
-    of slug naming, so the producer (train) and consumers (orchestrator/analysis)
-    cannot drift. Semantic identity lives in RunSpec/run.json, NOT in this string.
+    of slug naming. Semantic identity lives in RunSpec/run.json, NOT in this string.
 
-      standard            -> "<algo>"                         e.g. "ddpg"
-      shadow agent + reg  -> "shadow_<algo>_agent_reg<lambda>"
-      shadow td3 qvalue   -> "shadow_<algo>_qvalue_<switch_critic>"
-      shadow (other)      -> "shadow_<algo>_<mode>"
+      offline (BC)        -> "offline_<algo>_bc"      e.g. "offline_td3_bc"
+      offline_to_online   -> "o2o_<algo>"
+      online_contrast     -> "online_<algo>"
     """
     algo = algorithm.value
-    if not shadow:
-        return algo
-    if mode is SwitchingMode.AGENT and lambda_reg > 0.0:
-        return f"shadow_{algo}_agent_reg{lambda_reg}"
-    if algorithm is Algorithm.TD3 and mode is SwitchingMode.Q_VALUE:
-        return f"shadow_{algo}_{mode.value}_{switch_critic.value}"
-    return f"shadow_{algo}_{mode.value}"
+    match mode:
+        case TrainingMode.OFFLINE:
+            return f"offline_{algo}_bc" if bc else f"offline_{algo}"
+        case TrainingMode.OFFLINE_TO_ONLINE:
+            return f"o2o_{algo}"
+        case TrainingMode.ONLINE_CONTRAST:
+            return f"online_{algo}"
 
 
 # ---------------------------------------------------------------------------
@@ -136,118 +135,79 @@ def run_label_for(
 @dataclass(frozen=True)
 class Condition:
     """
-    One *learned* training configuration (run once per seed). Fully typed: the
-    shadow-only fields are None/ignored for standard runs. Produces both its
-    train() kwargs and a RunSpec from the SAME fields, so config and metadata
-    cannot disagree. Use the `standard()` / `shadow()` factories for readability.
+    One training configuration (run once per seed). Produces both its agent
+    kwargs and a RunSpec from the SAME fields, so config and metadata cannot
+    disagree. Use the offline()/offline_to_online()/online_contrast() factories.
     """
     label: str
     algorithm: Algorithm
-    shadow: bool = False
-    switching_mode: SwitchingMode | None = None
-    lambda_reg: float = 0.0
-    eta_agent: float = 0.5
-    switch_critic: TD3SwitchCritic | None = None
-
-    def __post_init__(self) -> None:
-        # Reject incoherent combinations rather than silently ignoring them.
-        if not self.shadow and (self.switching_mode is not None or self.switch_critic is not None):
-            raise ValueError("standard (non-shadow) Condition must not set switching_mode/switch_critic")
-        if self.switch_critic is not None and not self.is_td3_qvalue:
-            raise ValueError("switch_critic only applies to shadow TD3 q-value switching")
+    training_mode: TrainingMode
+    bc_alpha: float = 2.5
 
     @property
-    def mode(self) -> SwitchingMode:
-        """Effective switching mode (defaults to Q-value for shadow runs)."""
-        return self.switching_mode or SwitchingMode.Q_VALUE
-
-    @property
-    def is_td3_qvalue(self) -> bool:
-        return self.shadow and self.algorithm is Algorithm.TD3 and self.mode is SwitchingMode.Q_VALUE
+    def uses_bc(self) -> bool:
+        return self.bc_alpha > 0.0 and self.training_mode is not TrainingMode.ONLINE_CONTRAST
 
     @property
     def slug(self) -> str:
-        return run_label_for(
-            self.algorithm, shadow=self.shadow, mode=self.mode,
-            lambda_reg=self.lambda_reg,
-            switch_critic=self.switch_critic or TD3SwitchCritic.Q1,
-        )
+        return run_label_for(self.algorithm, self.training_mode, self.uses_bc)
 
-    def train_kwargs(self) -> dict[str, Any]:
-        """Kwargs forwarded to train.train() (strings at that CLI-style boundary)."""
-        kw: dict[str, Any] = {"model_type": self.algorithm.value, "shadow": self.shadow}
-        if self.shadow:
-            kw["mode"] = self.mode.value
-            kw["lambda_reg"] = self.lambda_reg
-            kw["eta_agent"] = self.eta_agent
-            if self.is_td3_qvalue:
-                kw["switch_critic"] = (self.switch_critic or TD3SwitchCritic.Q1).value
-        return kw
+    def agent_kwargs(self) -> dict[str, Any]:
+        """Hyperparameters forwarded to the agent constructor."""
+        bc = self.bc_alpha if self.training_mode is not TrainingMode.ONLINE_CONTRAST else 0.0
+        return {"bc_alpha": bc}
 
-    def to_run_spec(self, scenario: Scenario, seed: int, total_steps: int) -> "RunSpec":
-        """Bind this condition to a (scenario, seed, budget) — the only RunSpec factory."""
-        # switch_critic is only meaningful for TD3 q-value switching; record the
-        # SAME effective value the slug/train_kwargs use, so the grid-side and
-        # train-side RunSpecs cannot disagree.
-        effective_switch = (self.switch_critic or TD3SwitchCritic.Q1) if self.is_td3_qvalue else None
+    def to_run_spec(self, scenario: Scenario, seed: int, *, offline_steps: int,
+                    online_steps: int, expert_kind: ExpertKind) -> "RunSpec":
         return RunSpec(
-            scenario=scenario, algorithm=self.algorithm, shadow=self.shadow,
-            total_steps=total_steps, seed=seed,
+            scenario=scenario, algorithm=self.algorithm, training_mode=self.training_mode,
+            bc_alpha=self.bc_alpha, offline_steps=offline_steps, online_steps=online_steps,
+            seed=seed, expert_kind=expert_kind,
             condition_label=self.label, run_label=self.slug,
-            switching_mode=self.mode if self.shadow else None,
-            lambda_reg=self.lambda_reg, eta_agent=self.eta_agent,
-            switch_critic=effective_switch,
         )
 
 
-def standard(algorithm: Algorithm, label: str | None = None) -> Condition:
-    """A standard (no-shadow) condition."""
-    return Condition(label=label or algorithm.value.upper(), algorithm=algorithm, shadow=False)
+def offline(algorithm: Algorithm, bc_alpha: float = 2.5, label: str | None = None) -> Condition:
+    """Offline (TD3+BC / DDPG+BC) condition — the headline method."""
+    tag = "+BC" if bc_alpha > 0 else ""
+    return Condition(label=label or f"Offline {algorithm.value.upper()}{tag}",
+                     algorithm=algorithm, training_mode=TrainingMode.OFFLINE, bc_alpha=bc_alpha)
 
 
-def shadow(
-    algorithm: Algorithm,
-    mode: SwitchingMode = SwitchingMode.Q_VALUE,
-    *,
-    lambda_reg: float = 0.0,
-    eta_agent: float = 0.5,
-    switch_critic: TD3SwitchCritic | None = None,
-    label: str | None = None,
-) -> Condition:
-    """A shadow-mode condition (switching_mode always set)."""
-    auto = f"Shadow {algorithm.value.upper()} ({mode.value})"
-    return Condition(
-        label=label or auto, algorithm=algorithm, shadow=True, switching_mode=mode,
-        lambda_reg=lambda_reg, eta_agent=eta_agent, switch_critic=switch_critic,
-    )
+def offline_to_online(algorithm: Algorithm, bc_alpha: float = 1.0,
+                      label: str | None = None) -> Condition:
+    """Offline pretrain then conservative, expert-guarded online fine-tuning."""
+    return Condition(label=label or f"O2O {algorithm.value.upper()}",
+                     algorithm=algorithm, training_mode=TrainingMode.OFFLINE_TO_ONLINE,
+                     bc_alpha=bc_alpha)
+
+
+def online_contrast(algorithm: Algorithm, label: str | None = None) -> Condition:
+    """Naive online RL on the live plant (the unsafe contrast baseline)."""
+    return Condition(label=label or f"Online {algorithm.value.upper()} (contrast)",
+                     algorithm=algorithm, training_mode=TrainingMode.ONLINE_CONTRAST, bc_alpha=0.0)
 
 
 # ---------------------------------------------------------------------------
-# RunSpec — a Condition bound to (scenario, seed, budget)
+# RunSpec — a Condition bound to (scenario, seed, budgets)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class RunSpec:
-    """
-    Everything needed to identify one trained model, with no reference to its
-    directory name. Serialised to run.json beside the checkpoint. Built only via
-    Condition.to_run_spec() or from_json()/from_checkpoint().
-    """
+    """Everything needed to identify one trained model. Serialised to run.json."""
     scenario: Scenario
     algorithm: Algorithm
-    shadow: bool
-    total_steps: int
+    training_mode: TrainingMode
+    bc_alpha: float
+    offline_steps: int
+    online_steps: int
     seed: int
-    condition_label: str               # human label for tables/plots
-    run_label: str                     # directory slug (convenience only)
-    switching_mode: SwitchingMode | None = None
-    lambda_reg: float = 0.0
-    eta_agent: float = 0.5
-    switch_critic: TD3SwitchCritic | None = None
+    expert_kind: ExpertKind
+    condition_label: str
+    run_label: str
 
     @property
     def artifact_stem(self) -> str:
-        """Unique, human-readable file stem for this run's rollout (object -> name)."""
         return f"{self.run_label}__seed{self.seed}"
 
     def to_json(self) -> dict[str, Any]:
@@ -258,15 +218,14 @@ class RunSpec:
         return cls(
             scenario=Scenario(d["scenario"]),
             algorithm=Algorithm(d["algorithm"]),
-            shadow=bool(d["shadow"]),
-            total_steps=int(d["total_steps"]),
+            training_mode=TrainingMode(d["training_mode"]),
+            bc_alpha=float(d["bc_alpha"]),
+            offline_steps=int(d["offline_steps"]),
+            online_steps=int(d.get("online_steps", 0)),
             seed=int(d["seed"]),
+            expert_kind=ExpertKind(d["expert_kind"]),
             condition_label=str(d["condition_label"]),
             run_label=str(d["run_label"]),
-            switching_mode=_opt_enum(SwitchingMode, d.get("switching_mode")),
-            lambda_reg=float(d.get("lambda_reg", 0.0)),
-            eta_agent=float(d.get("eta_agent", 0.5)),
-            switch_critic=_opt_enum(TD3SwitchCritic, d.get("switch_critic")),
         )
 
 
@@ -282,21 +241,22 @@ class ModelSpec:
 
 
 # ---------------------------------------------------------------------------
-# MethodRecord — one structured manifest entry per rolled-out method
+# MethodRecord — one structured manifest entry per rolled-out method + stage
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class MethodRecord:
     """
     A method's entry in a rollout manifest. `run` is populated for MODEL methods
-    and None for reference controllers (PID / NMPC oracle). Phase 4 groups and
-    aggregates on these fields — it never parses `npz_file`.
+    and None for reference controllers (PID / NMPC). `stage` records the
+    deployment stage for MODEL rollouts (None for references).
     """
     role: MethodRole
     label: str
     npz_file: str
     scenario: Scenario
     run: RunSpec | None = None
+    stage: DeploymentStage | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self, dict_factory=_json_factory)
@@ -310,4 +270,5 @@ class MethodRecord:
             npz_file=str(d["npz_file"]),
             scenario=Scenario(d["scenario"]),
             run=RunSpec.from_json(run) if run else None,
+            stage=_opt_enum(DeploymentStage, d.get("stage")),
         )
