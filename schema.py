@@ -55,10 +55,16 @@ class TrainingMode(enum.StrEnum):
                           (shadow -> autonomous) deployment.
       online_contrast   — naive online RL trained on the live plant from scratch
                           (the unsafe foil the offline method is meant to avoid).
+      online_shadow     — online RL from scratch but expert-GUARDED every step
+                          (G&A-style earned-takeover gate, no offline pretrain).
+                          Shares online_contrast's from-scratch init; the ONLY
+                          difference is the guard. The fair shadow-vs-standard
+                          learning ablation (stability / speed / early trajectory).
     """
     OFFLINE = "offline"
     OFFLINE_TO_ONLINE = "offline_to_online"
     ONLINE_CONTRAST = "online_contrast"
+    ONLINE_SHADOW = "online_shadow"
 
 
 class ExpertKind(enum.StrEnum):
@@ -126,6 +132,8 @@ def run_label_for(algorithm: Algorithm, mode: TrainingMode, bc: bool) -> str:
             return f"o2o_{algo}"
         case TrainingMode.ONLINE_CONTRAST:
             return f"online_{algo}"
+        case TrainingMode.ONLINE_SHADOW:
+            return f"online_shadow_{algo}"
 
 
 # ---------------------------------------------------------------------------
@@ -144,9 +152,11 @@ class Condition:
     training_mode: TrainingMode
     bc_alpha: float = 2.5
 
+    _ONLINE_FROM_SCRATCH = (TrainingMode.ONLINE_CONTRAST, TrainingMode.ONLINE_SHADOW)
+
     @property
     def uses_bc(self) -> bool:
-        return self.bc_alpha > 0.0 and self.training_mode is not TrainingMode.ONLINE_CONTRAST
+        return self.bc_alpha > 0.0 and self.training_mode not in self._ONLINE_FROM_SCRATCH
 
     @property
     def slug(self) -> str:
@@ -154,7 +164,7 @@ class Condition:
 
     def agent_kwargs(self) -> dict[str, Any]:
         """Hyperparameters forwarded to the agent constructor."""
-        bc = self.bc_alpha if self.training_mode is not TrainingMode.ONLINE_CONTRAST else 0.0
+        bc = 0.0 if self.training_mode in self._ONLINE_FROM_SCRATCH else self.bc_alpha
         return {"bc_alpha": bc}
 
     def to_run_spec(self, scenario: Scenario, seed: int, *, offline_steps: int,
@@ -186,6 +196,14 @@ def online_contrast(algorithm: Algorithm, label: str | None = None) -> Condition
     """Naive online RL on the live plant (the unsafe contrast baseline)."""
     return Condition(label=label or f"Online {algorithm.value.upper()} (contrast)",
                      algorithm=algorithm, training_mode=TrainingMode.ONLINE_CONTRAST, bc_alpha=0.0)
+
+
+def online_shadow(algorithm: Algorithm, label: str | None = None) -> Condition:
+    """Online RL from scratch, expert-guarded every step (G&A earned-takeover gate,
+    no offline pretrain). Same from-scratch init as online_contrast; the guard is
+    the only difference — the fair shadow-vs-standard learning ablation."""
+    return Condition(label=label or f"Online shadow {algorithm.value.upper()}",
+                     algorithm=algorithm, training_mode=TrainingMode.ONLINE_SHADOW, bc_alpha=0.0)
 
 
 # ---------------------------------------------------------------------------

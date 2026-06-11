@@ -96,7 +96,8 @@ class ModelRef:
     expert_kind: ExpertKind
 
     def run_spec(self) -> RunSpec:
-        ofs = self.offline_steps if self.condition.training_mode is not TrainingMode.ONLINE_CONTRAST else 0
+        ofs = 0 if self.condition.training_mode in (
+            TrainingMode.ONLINE_CONTRAST, TrainingMode.ONLINE_SHADOW) else self.offline_steps
         return self.condition.to_run_spec(
             Scenario(self.scenario), self.seed,
             offline_steps=ofs, online_steps=self.online_steps, expert_kind=self.expert_kind)

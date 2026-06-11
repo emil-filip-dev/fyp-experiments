@@ -170,13 +170,17 @@ def _stage_for(progress: float, frac_shadow: float):
 
 def finetune_o2o(agent, run_spec: RunSpec, expert, *, save_path: str,
                  eval_freq: int = 2_000, n_eval: int = 5,
-                 frac_shadow: float = 0.7, margin: float = 0.0,
+                 frac_shadow: float = 1.0, margin: float = 0.0,
                  snapshot_freq: int = 0, init_best: float = -np.inf) -> str:
     """
     Continue training the (already offline-pretrained) agent from expert-guarded
-    online transitions, sweeping shadow -> autonomous over run_spec.online_steps
-    env steps. In the shadow phase the expert executes for un-earned actions, so
-    behaviour-time safety is preserved while the agent fine-tunes on-distribution.
+    online transitions. The fine-tune stays in SHADOW for the *entirety* of the
+    run (frac_shadow=1.0): the expert executes for every un-earned action, so the
+    agent only ever drives the plant when q_gap > margin and the expert guards it
+    otherwise. behaviour-time safety is therefore preserved throughout while the
+    agent fine-tunes on-distribution -- O2O never runs unguarded-autonomous on the
+    plant during learning. (frac_shadow < 1.0 would sweep into an unguarded
+    autonomous tail; we keep it at 1.0 by design -- see C3.)
     Records the behaviour-time curve (the C1/C3 evidence) and a deployment curve.
 
     `init_best` carries the offline phase's best eval return so best.pt is only
@@ -377,6 +381,125 @@ def train_online_contrast(agent, run_spec: RunSpec, expert, *, save_path: str,
 
 
 # ---------------------------------------------------------------------------
+# Online shadow-mode RL FROM SCRATCH (G&A earned-takeover gate, no pretrain)
+# ---------------------------------------------------------------------------
+
+def train_online_shadow(agent, run_spec: RunSpec, expert, *, save_path: str,
+                        eval_freq: int = 2_000, n_eval: int = 5, margin: float = 0.0,
+                        warmup_steps: int = 1_000, snapshot_freq: int = 0) -> str:
+    """
+    Train the agent online FROM SCRATCH while the expert GUARDS every step: the
+    agent's (exploratory) proposal is executed iff it has earned authority
+    (q_gap(obs, a_expert) > margin), otherwise the expert acts. The agent learns
+    from whatever was executed. This is Gassert & Althoff online shadow mode with
+    no offline pretrain — it shares online_contrast's random init and exploration,
+    and the expert guard is the ONLY difference. The fair "shadow vs standard"
+    learning ablation (supervisor Q2 speed / Q3 early trajectory; the guard also
+    keeps behaviour-time violations low even from a random init -> C1/C3).
+
+    During the first `warmup_steps` env steps the EXPERT is forced to drive (the
+    agent only observes): the q_gap gate is meaningless under a random-init critic
+    (it would hand control to a flailing random policy), so we first seed the
+    critic with expert-action transitions, then let earned takeover engage. The
+    takeover fraction therefore starts at ~0 and rises as the agent improves
+    (recorded as beh_takeover — the C3 graduated-autonomy signal).
+    """
+    scenario = run_spec.scenario
+    cfg = SCENARIOS[str(scenario)]
+    n_steps = cfg["n_steps"]
+    constraint_spec = cfg.get("constraint_spec", [])
+    env = make_env_for(str(scenario))
+    controller = ShadowController(agent, expert, safety_fallback=False)
+    total = run_spec.online_steps
+
+    beh = {"env_step": [], "return": [], "viol_rate": [], "viol_max": [],
+           "viol_count": [], "takeover": []}
+    evl = {"env_step": [], "return": [], "viol_rate": [], "takeover": []}
+    best = -np.inf
+    episode = 0
+    next_snap = snapshot_freq
+    if snapshot_freq:
+        _save_snapshot(agent, save_path, "online", 0)   # random-init snapshot
+
+    bar = tqdm(total=total, unit="step", dynamic_ncols=True, desc=f"{run_spec.run_label} (shadow)")
+    while agent.total_env_steps < total:
+        obs, _ = env.reset(seed=episode + run_spec.seed * 10_000)
+        controller.reset()
+        done, step = False, 0
+        ep_ret = 0.0
+        flags, states = [], []
+        start = agent.total_env_steps
+        while not done and step < n_steps:
+            a_exec, used, _, a_expert = controller.decide(
+                obs, DeploymentStage.SHADOW, margin=margin, explore=True)
+            if agent.total_env_steps < warmup_steps:
+                a_exec, used = a_expert, False   # expert-forced warmup (seed the critic)
+            next_obs, r, term, trunc, _ = env.step(a_exec)
+            done = bool(term or trunc)
+            agent.store(obs, a_exec, r, next_obs, done)
+            states.append(env.state.copy().astype(np.float32))
+            flags.append(1.0 if used else 0.0)
+            ep_ret += r
+            obs = next_obs
+            step += 1
+            agent.total_env_steps += 1
+        if agent.total_env_steps >= warmup_steps:
+            for _ in range(step):
+                agent.update()
+        bar.update(agent.total_env_steps - start)
+        if snapshot_freq and agent.total_env_steps >= next_snap:
+            _save_snapshot(agent, save_path, "online", agent.total_env_steps)
+            next_snap += snapshot_freq
+
+        bv = violation_magnitudes(np.asarray(states, dtype=np.float32), constraint_spec)
+        any_v = (bv > 0).any(axis=-1) if bv.shape[-1] else np.zeros(bv.shape[0], dtype=bool)
+        beh["env_step"].append(int(agent.total_env_steps))
+        beh["return"].append(float(ep_ret))
+        beh["viol_rate"].append(float(any_v.mean()) if any_v.size else 0.0)
+        beh["viol_max"].append(float(bv.max()) if bv.size else 0.0)
+        beh["viol_count"].append(int(any_v.sum()))
+        beh["takeover"].append(float(np.mean(flags)) * 100.0)
+
+        if agent.total_env_steps >= eval_freq * (len(evl["env_step"]) + 1):
+            ev = evaluate_deploy(agent, scenario, expert,
+                                 stage=DeploymentStage.AUTONOMOUS, n_episodes=n_eval)
+            evl["env_step"].append(int(agent.total_env_steps))
+            evl["return"].append(ev["return_mean"]); evl["viol_rate"].append(ev["viol_rate"])
+            evl["takeover"].append(ev["takeover_frac"])
+            if ev["return_mean"] > best:
+                best = ev["return_mean"]
+                agent.save(os.path.join(save_path, "best.pt"))
+        episode += 1
+        bar.set_postfix({"ret": f"{ep_ret:.0f}", "agent%": f"{np.mean(flags)*100:.0f}",
+                         "best": f"{best:.0f}"})
+    bar.close()
+
+    if not os.path.exists(os.path.join(save_path, "best.pt")):
+        agent.save(os.path.join(save_path, "best.pt"))
+
+    meta = _log_meta(run_spec, warmup_steps)
+    meta["schema"] = {
+        "beh_env_step": "cumulative env step at episode end",
+        "beh_return": "behaviour return (expert-guarded, from scratch)",
+        "beh_viol_rate": "behaviour violation rate (guarded online exploration, C1/C3)",
+        "beh_viol_max": "behaviour max violation magnitude",
+        "beh_viol_count": "# violated steps in the episode",
+        "beh_takeover": "agent takeover % over the episode (earned authority rising, C3)",
+        "eval_*": "periodic standalone (autonomous) deployment metrics",
+    }
+    path = _save_log(
+        save_path, "online_shadow", meta,
+        beh_env_step=beh["env_step"], beh_return=beh["return"],
+        beh_viol_rate=beh["viol_rate"], beh_viol_max=beh["viol_max"],
+        beh_viol_count=beh["viol_count"], beh_takeover=beh["takeover"],
+        eval_env_step=evl["env_step"], eval_return=evl["return"],
+        eval_viol_rate=evl["viol_rate"], eval_takeover=evl["takeover"],
+    )
+    tqdm.write(f"  Online shadow (from scratch) done. Log: {path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Metadata + dispatch
 # ---------------------------------------------------------------------------
 
@@ -425,7 +548,8 @@ def run_condition(
     expert, expert_kind = make_expert(scenario, mpc_horizon=mpc_horizon)
     run_spec = condition.to_run_spec(
         scenario, seed,
-        offline_steps=offline_steps if condition.training_mode is not TrainingMode.ONLINE_CONTRAST else 0,
+        offline_steps=0 if condition.training_mode in (
+            TrainingMode.ONLINE_CONTRAST, TrainingMode.ONLINE_SHADOW) else offline_steps,
         online_steps=online_steps,
         expert_kind=expert_kind,
     )
@@ -466,6 +590,9 @@ def run_condition(
     elif mode is TrainingMode.ONLINE_CONTRAST:
         train_online_contrast(agent, run_spec, expert, save_path=save_path,
                               eval_freq=eval_freq, snapshot_freq=snap_online)
+    elif mode is TrainingMode.ONLINE_SHADOW:
+        train_online_shadow(agent, run_spec, expert, save_path=save_path,
+                            eval_freq=eval_freq, snapshot_freq=snap_online)
     else:
         raise ValueError(f"Unhandled training mode {mode!r}")
 

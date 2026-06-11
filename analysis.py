@@ -851,6 +851,306 @@ def plot_training_safety(runs_by_condition: dict[str, list[str]], scenario: str,
     return path
 
 
+# ---------------------------------------------------------------------------
+# Deployment-time safety: cumulative violations incurred over the DEPLOYMENT
+# timeline (frozen policy from run_rollouts), the deploy-side analogue of
+# plot_training_safety. For a continually-learning method (O2O) this is the live
+# shadow-deployment trace; for frozen policies it is the as-deployed accumulation.
+# ---------------------------------------------------------------------------
+
+def plot_deployment_safety(rollout_dir: str, out_dir: str, *,
+                           order: list[str] | None = None) -> str:
+    """Cumulative constraint-violating steps incurred over the deployment timeline
+    (each seed's rollout episodes concatenated), per model x stage (median + IQR
+    across seeds), + a total-violations bar. Same style as plot_training_safety but
+    sourced from deploy.run_rollouts `.npz` files. Identity comes from the
+    MethodRecord (never the filename). Writes deployment_safety.png +
+    deployment_safety_summary.csv to out_dir."""
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(rollout_dir, "manifest.json"), encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    # per-seed cumulative-violation curves, grouped by (condition x stage)
+    curves: dict[str, list[np.ndarray]] = defaultdict(list)
+    for m in manifest["methods"]:
+        rec = MethodRecord.from_json(m)
+        if rec.role is not MethodRole.MODEL or rec.run is None:
+            continue                                    # models only (skip PID/NMPC refs)
+        z = np.load(os.path.join(rollout_dir, rec.npz_file))
+        if "violations" not in z:
+            continue
+        v = np.asarray(z["violations"], float)          # [E, T, n_con] magnitudes
+        per_step = (v > 0).any(axis=-1) if v.ndim == 3 else (v > 0)   # [E, T]
+        timeline = per_step.reshape(-1).astype(float)   # episodes concatenated -> [E*T]
+        curves[_group_key(rec)].append(np.cumsum(timeline))
+
+    if order:                                           # caller-specified series order
+        labels = [l for l in order if l in curves] + [l for l in curves if l not in order]
+    else:
+        labels = sorted(curves)
+    max_len = max((len(c) for cs in curves.values() for c in cs), default=1)
+    grid = np.arange(max_len)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5),
+                                   gridspec_kw={"width_ratios": [2, 1]})
+    colors = dict(zip(labels, _palette(len(labels))))
+    totals: dict[str, list[float]] = {}
+    for label in labels:
+        cs = curves[label]
+        col = colors[label]
+        stack = np.stack([np.interp(grid, np.arange(len(c)), c) for c in cs])
+        ax1.plot(grid, np.median(stack, axis=0), color=col, lw=2.2, label=label)
+        ax1.fill_between(grid, np.percentile(stack, 25, axis=0),
+                         np.percentile(stack, 75, axis=0), color=col, alpha=0.15)
+        totals[label] = [float(c[-1]) for c in cs]
+    ax1.set_xlabel("deployment step (rollout episodes concatenated)")
+    ax1.set_ylabel("cumulative constraint-violating steps")
+    ax1.set_title(f"Violations incurred while deployed — {manifest['scenario']}")
+    ax1.grid(alpha=0.3); ax1.legend(fontsize=8, loc="upper left")
+
+    y = np.arange(len(labels))
+    ax2.barh(y, [_median(totals[l]) for l in labels],
+             xerr=[_mad(totals[l]) for l in labels], color=[colors[l] for l in labels],
+             alpha=0.85, error_kw={"elinewidth": 1, "capsize": 3})
+    ax2.set_yticks(y); ax2.set_yticklabels(labels, fontsize=8); ax2.invert_yaxis()
+    ax2.set_xlabel("total violated steps over deployment (median ± MAD)")
+    ax2.set_title("Deployment-time safety cost"); ax2.grid(alpha=0.3, axis="x")
+    fig.suptitle(f"Deployment-time safety — {manifest['scenario']}", fontsize=12)
+    fig.tight_layout()
+    path = os.path.join(out_dir, "deployment_safety.png")
+    fig.savefig(path, dpi=130); plt.close(fig)
+
+    with open(os.path.join(out_dir, "deployment_safety_summary.csv"), "w",
+              newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["method_stage", "n_seeds", "total_violations_median",
+                    "total_violations_mad", "deployment_steps_per_seed"])
+        for l in labels:
+            w.writerow([l, len(totals[l]), f"{_median(totals[l]):.2f}",
+                        f"{_mad(totals[l]):.2f}", max_len])
+    print(f"  deployment-safety -> {path}")
+    return path
+
+
+_CURVE_KEYS = {
+    "behaviour": ("beh_env_step", "beh_return"),
+    "eval": ("eval_env_step", "eval_return"),
+}
+
+
+def build_snapshot_eval_curve(run_dir: str, *, n_eval: int = 10, n_steps: int | None = None,
+                              overwrite: bool = False):
+    """
+    Evaluate each ONLINE snapshot of a run AGENT-ALONE (autonomous, no expert) on
+    held-out eval seeds to build a DENSE, methodologically-uniform learning curve
+    (env_step -> agent-only return). Writes snapshot_eval.npz in run_dir and returns
+    (steps, returns), or None if the run has no online snapshots.
+
+    This is the fair learning-speed / early-trajectory signal: it isolates the
+    AGENT's own policy quality over training (the behaviour curve mixes in the
+    expert's guarded actions). It is NMPC-free (only agent.act), so it's cheap and
+    can be rebuilt for every condition uniformly without retraining.
+    """
+    import json
+    import torch
+    from models import get_agent
+    from scenarios import SCENARIOS, make_env_for
+
+    out_path = os.path.join(run_dir, "snapshot_eval.npz")
+    if not overwrite and os.path.exists(out_path):
+        z = np.load(out_path)
+        return z["env_step"], z["eval_return"]
+    idx_path = os.path.join(run_dir, "snapshots", "snapshots.json")
+    run_json = os.path.join(run_dir, "run.json")
+    if not (os.path.exists(idx_path) and os.path.exists(run_json)):
+        return None
+    with open(idx_path, encoding="utf-8") as f:
+        snaps = [s for s in json.load(f) if s.get("phase") == "online"]
+    if not snaps:
+        return None
+    with open(run_json, encoding="utf-8") as f:
+        rs = json.load(f)
+    scenario, algo = rs["scenario"], rs["algorithm"]
+    cfg = SCENARIOS[str(scenario)]
+    n_steps = n_steps or cfg["n_steps"]
+    env = make_env_for(str(scenario))
+    AgentCls = get_agent(algo)
+
+    cpu = torch.device("cpu")
+    steps, returns = [], []
+    for s in sorted(snaps, key=lambda d: d["step"]):
+        ckpt = torch.load(os.path.join(run_dir, "snapshots", s["file"]),
+                          map_location=cpu, weights_only=False)
+        agent = AgentCls.load(ckpt, cpu)
+        rets = []
+        for ep in range(n_eval):
+            obs, _ = env.reset(seed=1_000_000 + ep)   # held-out eval seeds (EVAL_SEED_OFFSET)
+            done, st, R = False, 0, 0.0
+            while not done and st < n_steps:
+                obs, r, term, trunc, _ = env.step(agent.act(obs, explore=False))
+                done = bool(term or trunc); R += r; st += 1
+            rets.append(R)
+        steps.append(int(s["step"])); returns.append(float(np.mean(rets)))
+    steps, returns = np.array(steps), np.array(returns)
+    np.savez(out_path, env_step=steps, eval_return=returns)
+    return steps, returns
+
+
+def _learning_curve(run_dir: str, smooth: int = 5, curve: str = "behaviour"):
+    """(env_step, return) learning curve, lightly smoothed. `curve`:
+      behaviour     — on-plant return during learning (training_log.npz)
+      eval          — agent-alone eval return logged during training (sparse)
+      snapshot_eval — dense agent-alone curve from snapshot_eval.npz (build first
+                      via build_snapshot_eval_curve). Returns None if absent."""
+    if curve == "snapshot_eval":
+        p = os.path.join(run_dir, "snapshot_eval.npz")
+        if not os.path.exists(p):
+            return None
+        z = np.load(p)
+        steps, ret = np.asarray(z["env_step"], float), np.asarray(z["eval_return"], float)
+        return (steps, ret) if len(steps) >= 2 else None
+    step_key, ret_key = _CURVE_KEYS[curve]
+    z = np.load(os.path.join(run_dir, "training_log.npz"), allow_pickle=False)
+    if step_key not in z or len(z[step_key]) < 2:
+        return None
+    steps = np.asarray(z[step_key], float)
+    ret = np.asarray(z[ret_key], float)
+    if smooth > 1 and len(ret) >= 2 * smooth:   # don't over-smooth a sparse eval curve
+        k = np.ones(smooth) / smooth
+        ret = np.convolve(ret, k, mode="same")
+    return steps, ret
+
+
+def ref_returns(rollout_dir: str) -> tuple[float | None, float | None]:
+    """(NMPC median return, PID median return) from a rollout dir's metrics CSV."""
+    path = os.path.join(rollout_dir, "analysis", "metrics_summary.csv")
+    if not os.path.exists(path):
+        return None, None
+    m = {r["method"]: float(r["return_median"]) for r in csv.DictReader(open(path))}
+    return m.get("NMPC"), m.get("PID")
+
+
+def compare_learning(shadow_runs: list[str], standard_runs: list[str], scenario: str,
+                     out_dir: str, *, expert_return: float | None = None,
+                     pid_return: float | None = None, early_frac: float = 0.25,
+                     threshold_frac: float = 0.9, smooth: int = 5,
+                     curve: str = "behaviour",
+                     shadow_label: str = "shadow (O2O)",
+                     standard_label: str = "standard (online)") -> dict | None:
+    """
+    Compare shadow vs standard LEARNING curves across seeds: stability, speed, and
+    early-trajectory similarity. Writes mode_comparison.png + mode_comparison.csv.
+    `curve` = "behaviour" (return on the plant during learning; safety/reliability)
+    or "eval" (agent-alone autonomous policy quality; the fair learning-speed signal).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    S = [c for d in shadow_runs if (c := _learning_curve(d, smooth, curve)) is not None]
+    T = [c for d in standard_runs if (c := _learning_curve(d, smooth, curve)) is not None]
+    if not S or not T:
+        print(f"  [compare_learning] {scenario}: missing curves (shadow={len(S)}, standard={len(T)})")
+        return None
+
+    max_step = min(max(s[0][-1] for s in S), max(t[0][-1] for t in T))
+    grid = np.linspace(0, max_step, 200)
+    Sm = np.stack([np.interp(grid, s, r) for s, r in S])   # [n_seed, G]
+    Tm = np.stack([np.interp(grid, s, r) for s, r in T])
+    Smed, Tmed = np.median(Sm, 0), np.median(Tm, 0)
+
+    # ---- stability ----
+    tail = slice(int(0.8 * len(grid)), None)
+    term_S, term_T = Sm[:, tail].mean(1), Tm[:, tail].mean(1)
+    mdd = lambda r: float((np.maximum.accumulate(r) - r).max())
+    stab = {
+        "shadow_acrseed_std": float(np.median(np.std(Sm, 0))),
+        "standard_acrseed_std": float(np.median(np.std(Tm, 0))),
+        "shadow_terminal_iqr": float(np.subtract(*np.percentile(term_S, [75, 25]))),
+        "standard_terminal_iqr": float(np.subtract(*np.percentile(term_T, [75, 25]))),
+        "shadow_roughness": float(np.median([np.std(np.diff(r)) for _, r in S])),
+        "standard_roughness": float(np.median([np.std(np.diff(r)) for _, r in T])),
+        "shadow_max_drawdown": float(np.median([mdd(r) for _, r in S])),
+        "standard_max_drawdown": float(np.median([mdd(r) for _, r in T])),
+    }
+    stab["stability_ratio_std_over_shadow"] = (
+        stab["standard_acrseed_std"] / stab["shadow_acrseed_std"]
+        if stab["shadow_acrseed_std"] else float("nan"))
+    if pid_return is not None:
+        stab["shadow_seeds_below_PID"] = int((term_S < pid_return).sum())
+        stab["standard_seeds_below_PID"] = int((term_T < pid_return).sum())
+
+    # ---- speed ----
+    speed = {}
+    thr = None
+    if expert_return is not None and pid_return is not None and expert_return != pid_return:
+        thr = pid_return + threshold_frac * (expert_return - pid_return)
+        def steps_to(M):
+            out = []
+            for row in M:
+                hit = np.flatnonzero(row >= thr)
+                out.append(grid[hit[0]] if hit.size else np.nan)
+            return np.array(out)
+        def aulc(M):
+            norm = (M - pid_return) / (expert_return - pid_return)
+            trap = getattr(np, "trapezoid", None) or np.trapz
+            return trap(norm, grid, axis=1) / (grid[-1] or 1.0)
+        sS, sT = steps_to(Sm), steps_to(Tm)
+        speed = {
+            "threshold_return": float(thr),
+            "shadow_steps_to_threshold_median": float(np.nanmedian(sS)),
+            "standard_steps_to_threshold_median": float(np.nanmedian(sT)),
+            "shadow_AULC_median": float(np.median(aulc(Sm))),
+            "standard_AULC_median": float(np.median(aulc(Tm))),
+        }
+        ss, st = speed["shadow_steps_to_threshold_median"], speed["standard_steps_to_threshold_median"]
+        speed["speed_ratio_standard_over_shadow"] = (st / ss) if ss and ss > 0 else float("nan")
+
+    # ---- early trajectory ----
+    ne = max(3, int(early_frac * len(grid)))
+    a, b = Smed[:ne], Tmed[:ne]
+    pooled = np.std(np.vstack([Sm, Tm]), 0)
+    diff = np.abs(Smed - Tmed)
+    dv = np.flatnonzero(diff > pooled)
+    early = {
+        f"corr_first_{int(early_frac*100)}pct": float(np.corrcoef(a, b)[0, 1]),
+        f"rmse_first_{int(early_frac*100)}pct": float(np.sqrt(np.mean((a - b) ** 2))),
+        "divergence_step": float(grid[dv[0]]) if dv.size else None,
+        "divergence_frac_of_training": float(dv[0] / len(grid)) if dv.size else None,
+    }
+
+    # ---- figure ----
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for M, med, lbl, col in [(Sm, Smed, shadow_label, "tab:green"),
+                             (Tm, Tmed, standard_label, "tab:red")]:
+        ax.plot(grid, med, color=col, lw=2, label=lbl)
+        ax.fill_between(grid, np.percentile(M, 25, 0), np.percentile(M, 75, 0),
+                        color=col, alpha=0.15)
+    if expert_return is not None:
+        ax.axhline(expert_return, color="k", ls=":", lw=1, label="NMPC")
+    if pid_return is not None:
+        ax.axhline(pid_return, color="gray", ls=":", lw=1, label="PID")
+    if thr is not None:
+        ax.axhline(thr, color="tab:blue", ls="--", lw=1, label=f"{int(threshold_frac*100)}% threshold")
+    if early["divergence_step"]:
+        ax.axvline(early["divergence_step"], color="purple", ls="--", lw=1, label="divergence")
+    ax.set_xlabel("environment steps during learning")
+    _ylab = {"behaviour": "on-plant return during learning",
+             "eval": "agent-alone (autonomous) eval return",
+             "snapshot_eval": "agent-alone policy return (snapshot eval)"}.get(curve, "return")
+    ax.set_ylabel(f"{_ylab} (smoothed)")
+    ax.set_title(f"Shadow vs standard learning ({curve}) — {scenario}")
+    ax.grid(alpha=0.3); ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    png = os.path.join(out_dir, "mode_comparison.png")
+    fig.savefig(png, dpi=130); plt.close(fig)
+
+    with open(os.path.join(out_dir, "mode_comparison.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["group", "metric", "value"])
+        for grp, d in [("stability", stab), ("speed", speed), ("early_trajectory", early)]:
+            for k, v in d.items():
+                w.writerow([grp, k, v])
+    print(f"  compare_learning -> {png}")
+    return {"stability": stab, "speed": speed, "early_trajectory": early}
+
+
 def plot_training_curve(run_dir: str, out_path: str | None = None) -> str:
     """Learning curve(s) from a run's training_log.npz — mode-specific (offline:
     eval return + violation vs grad step; o2o/online: behaviour return + violation
