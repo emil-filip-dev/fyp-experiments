@@ -265,16 +265,17 @@ def _cstr_config():
         'high': np.array([1, 350, 0.9]),
     }
     r_scale = {'Ca': 1e3}
-    # Constraint copied VERBATIM from pc-gym_paper/constraint_showcase
-    # (constraint_paper.py / custom_reward.py / constraint_violation_vis.py):
-    #   cons = {'T': [327, 321]},  cons_type = {'T': ['<=', '>=']}
-    # i.e. reactor temperature bounded 321 K <= T <= 327 K. Passed as PC-Gym-native
-    # env_params so (a) the env populates info["cons_info"], and (b) PC-Gym's do-mpc
-    # oracle (models.NMPCController) reads it and imposes T as hard MPC state bounds.
-    # The showcase's flag values are used verbatim: done_on_cons_vio=False (record,
-    # don't terminate), r_penalty=False (reward unchanged — the OCP custom_reward
-    # ignores the constraint flag anyway).
-    cons = {'T': [327, 321]}
+    # Reactor-temperature constraint from PC-Gym's own constraints guide, which
+    # defines  cons = lambda x,u: [319 - T, T - 331]  i.e. 319 K <= T <= 331 K.
+    # (An earlier version of this file used 321..327 — WRONG: that band is too tight,
+    # it does not contain the verbatim x0 (T0=330 K starts OUTSIDE 327), and tracking
+    # the Ca setpoints forces T to ~326.5 K, so even the NMPC oracle violated ~17%.
+    # The documented 319..331 band contains x0 and gives the operating point ~4.5 K of
+    # headroom -> the expert is genuinely safe, as a well-posed constraint requires.)
+    # Passed PC-Gym-native so the env populates info["cons_info"] and the do-mpc oracle
+    # imposes T as hard MPC state bounds. done_on_cons_vio=False (record, don't
+    # terminate); r_penalty=False (reward unchanged).
+    cons = {'T': [331, 319]}
     cons_type = {'T': ['<=', '>=']}
     env_params = {
         'N': nsteps,
@@ -305,16 +306,13 @@ def _cstr_config():
         "plot_config": [
             {"state_idx": 0, "sp_idx": 2, "label": "Ca", "unit": "mol/L"},
         ],
-        # Constraint copied VERBATIM from pc-gym_paper/constraint_showcase
-        # (constraint_paper.py / custom_reward.py / constraint_violation_vis.py):
-        #   cons = {'T': [327, 321]},  cons_type = {'T': ['<=', '>=']}
-        # i.e. reactor temperature bounded 321 K <= T <= 327 K. State order for the
-        # cstr model is [Ca, T, Ca_SP], so T is physical-state index 1.
+        # Mirrors the native env_params constraint above (PC-Gym docs: 319 K <= T <= 331 K).
+        # State order for the cstr model is [Ca, T, Ca_SP], so T is physical-state index 1.
         "constraint_spec": [
             {"name": "T_max", "label": "Reactor temperature (upper)",
-             "state_idx": 1, "bound": 327, "type": "<=", "unit": "K"},
+             "state_idx": 1, "bound": 331, "type": "<=", "unit": "K"},
             {"name": "T_min", "label": "Reactor temperature (lower)",
-             "state_idx": 1, "bound": 321, "type": ">=", "unit": "K"},
+             "state_idx": 1, "bound": 319, "type": ">=", "unit": "K"},
         ],
     }
 
@@ -335,15 +333,17 @@ def _four_tank_config():
         'low': np.array([0, ] * 6),
         'high': np.array([0.6] * 6),
     }
-    # Constraint OURS (not verbatim PC-Gym — PC-Gym defines no four_tank constraint).
-    # Physically motivated: the two controlled lower tanks must not OVERFLOW their
-    # physical height (o_space high = 0.6 m). Calibrated against the measured
-    # operating envelope: the PID baseline peaks at h3=0.589/h4=0.337 (safe), while
-    # sustained max-pump actions drive h3 to 0.733 (overflow) -> the bound is
-    # respected by nominal control and crossed only by aggressive/exploratory
-    # control, which is exactly what the C1 safety-during-training claim needs.
-    # Passed PC-Gym-native so the do-mpc oracle enforces h3,h4 as hard state bounds.
-    cons = {'h3': [0.6], 'h4': [0.6]}
+    # Constraint OURS (not verbatim PC-Gym — PC-Gym defines no four_tank constraint;
+    # its docs describe 0.6 only as the tank HEIGHT / o_space ceiling). High-level
+    # bound h3,h4 <= 0.55 m: a "high-level alarm" set 0.05 m below the 0.6 m tank top.
+    # Set to 0.55 (NOT the 0.6 obs ceiling) so the constraint sits INSIDE the
+    # observable range — at 0.6 the normalised observation saturates (h=0.6 -> obs=1),
+    # leaving the agent blind to proximity/overshoot. Calibration: setpoints peak at
+    # h3=0.5; the do-mpc oracle (which enforces this bound) and the offline agent stay
+    # under 0.55, the sluggish PID overshoots to ~0.588, and unguarded exploration
+    # drives h3 to ~0.68 — so nominal/guarded control is safe while reckless control
+    # crosses, exactly what the C1 safety claim needs (and now perceivable to the agent).
+    cons = {'h3': [0.55], 'h4': [0.55]}
     cons_type = {'h3': ['<='], 'h4': ['<=']}
     env_params = {
         'N': nsteps,
@@ -377,10 +377,10 @@ def _four_tank_config():
         # Mirrors the native env_params constraints above for the eval pipeline's
         # env.state-based detection. State order [h1,h2,h3,h4,h3_sp,h4_sp] -> h3=2, h4=3.
         "constraint_spec": [
-            {"name": "h3_max", "label": "Tank 3 level (overflow)",
-             "state_idx": 2, "bound": 0.6, "type": "<=", "unit": "m"},
-            {"name": "h4_max", "label": "Tank 4 level (overflow)",
-             "state_idx": 3, "bound": 0.6, "type": "<=", "unit": "m"},
+            {"name": "h3_max", "label": "Tank 3 high-level",
+             "state_idx": 2, "bound": 0.55, "type": "<=", "unit": "m"},
+            {"name": "h4_max", "label": "Tank 4 high-level",
+             "state_idx": 3, "bound": 0.55, "type": "<=", "unit": "m"},
         ],
     }
 

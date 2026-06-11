@@ -38,7 +38,7 @@ import enum
 import io
 import os
 from collections import deque
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from typing import Self
 
 import numpy as np
@@ -548,6 +548,27 @@ class ShadowController:
 # ceiling. Verbatim from the previous oracle implementation (unchanged behaviour).
 # ---------------------------------------------------------------------------
 
+@contextmanager
+def _suppressed_fds(enabled: bool = True):
+    """Redirect C-level stdout(1)/stderr(2) to os.devnull for the duration. This is
+    what silences native CasADi/IPOPT solver warnings (e.g. 'nlp_g failed: NaN
+    detected for output g') — they are emitted from C++ and bypass a Python-level
+    redirect_stdout. No-op when `enabled` is False (pass quiet=False to see them)."""
+    if not enabled:
+        yield
+        return
+    import sys
+    sys.stdout.flush(); sys.stderr.flush()
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved1, saved2 = os.dup(1), os.dup(2)
+    try:
+        os.dup2(devnull, 1); os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved1, 1); os.dup2(saved2, 2)
+        os.close(devnull); os.close(saved1); os.close(saved2)
+
+
 class NMPCController:
     """
     Nonlinear MPC on a PC-Gym scenario, built on PC-Gym's own do-mpc `oracle`
@@ -560,12 +581,16 @@ class NMPCController:
     baseline is used as the expert instead.
     """
 
-    def __init__(self, cfg: dict, horizon: int = 20):
+    def __init__(self, cfg: dict, horizon: int = 20, quiet: bool = True):
         from pcgym import make_env
         from pcgym.oracle import oracle
 
+        # quiet=True suppresses the native CasADi/IPOPT solver chatter (incl. the
+        # benign 'NaN detected' line-search warnings). Pass quiet=False to debug.
+        self._quiet = quiet
         env_params = copy.deepcopy(cfg["env_params"])
-        self._oracle = oracle(make_env, env_params, MPC_params={"N": horizon})
+        with _suppressed_fds(self._quiet):
+            self._oracle = oracle(make_env, env_params, MPC_params={"N": horizon})
 
         self._nx = self._oracle.env.Nx_oracle
         self._a_low = np.asarray(env_params["a_space"]["low"], dtype=np.float64)
@@ -575,7 +600,7 @@ class NMPCController:
         self._normalise_o = env_params.get("normalise_o", True)
         self._x0 = np.asarray(cfg["env_params"]["x0"][:self._nx], dtype=np.float64)
 
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), _suppressed_fds(self._quiet):
             self._mpc, _ = self._oracle.setup_mpc()
 
         if self._oracle.has_disturbances or self._oracle.use_delta_u:
@@ -605,7 +630,7 @@ class NMPCController:
     def reset(self):
         self._mpc.reset_history()
         self._mpc.x0 = self._x0
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), _suppressed_fds(self._quiet):
             self._mpc.set_initial_guess()
 
     def predict(self, obs, deterministic: bool = True):
@@ -615,7 +640,7 @@ class NMPCController:
         else:
             phys = obs
         x0 = phys[:self._nx].reshape(-1, 1)
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), _suppressed_fds(self._quiet):
             u = np.asarray(self._mpc.make_step(x0)).flatten()
         u_norm = 2.0 * (u - self._a_low) / (self._a_high - self._a_low) - 1.0
         return np.clip(u_norm, -1.0, 1.0).astype(np.float32), None

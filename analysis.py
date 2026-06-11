@@ -763,6 +763,94 @@ def plot_takeover_map(run_dir: str, *, grid_res: int = 60, cell_px: int = 12,
     return out_dir
 
 
+# ---------------------------------------------------------------------------
+# Training-time safety (claim C1): constraint violations incurred ON THE PLANT
+# while learning. Offline = 0 (no plant interaction). o2o = expert-guarded (low).
+# online-contrast = unguarded exploration (the unsafe foil). This is the headline
+# safety evidence — distinct from the deployment-time violations in the rollouts.
+# ---------------------------------------------------------------------------
+
+def _training_violation_curve(run_dir: str):
+    """(env_step, cumulative violated-steps) incurred during learning, from a run's
+    training_log.npz. Returns None for offline runs (no plant interaction)."""
+    z = np.load(os.path.join(run_dir, "training_log.npz"), allow_pickle=False)
+    if "beh_env_step" not in z or len(z["beh_env_step"]) == 0:
+        return None
+    steps = np.asarray(z["beh_env_step"], float)
+    rate = np.asarray(z["beh_viol_rate"], float)            # per-episode violation rate
+    delta = np.diff(steps, prepend=0.0)                     # env steps per episode
+    return steps, np.cumsum(rate * delta)                   # expected violated steps, cumulative
+
+
+def plot_training_safety(runs_by_condition: dict[str, list[str]], scenario: str,
+                         out_dir: str) -> str:
+    """
+    Cumulative constraint violations incurred on the plant *during learning*, per
+    condition (median + IQR across seeds), + a total-violations bar. Offline runs
+    contribute a flat 0 line (zero plant interaction). Writes training_safety.png
+    and training_safety_summary.csv to out_dir.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    curves, totals, interactions = {}, {}, {}
+    max_step = 1.0
+    for label, dirs in runs_by_condition.items():
+        cs, ts, inter = [], [], 0
+        for d in dirs:
+            if not os.path.exists(os.path.join(d, "training_log.npz")):
+                continue
+            r = _training_violation_curve(d)
+            if r is None:
+                ts.append(0.0)                              # offline: 0 plant interaction
+            else:
+                steps, cum = r
+                cs.append((steps, cum)); ts.append(float(cum[-1]))
+                inter = int(steps[-1]); max_step = max(max_step, steps[-1])
+        curves[label], totals[label], interactions[label] = cs, ts, inter
+
+    grid = np.linspace(0, max_step, 200)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5),
+                                   gridspec_kw={"width_ratios": [2, 1]})
+    colors = dict(zip(curves, _palette(len(curves))))
+    for label, cs in curves.items():
+        col = colors[label]
+        if not cs:                                          # offline → flat 0
+            ax1.plot([0, max_step], [0, 0], color=col, lw=2.2,
+                     label=f"{label} (0 plant interactions)")
+            continue
+        interp = np.stack([np.interp(grid, s, c, left=0.0) for s, c in cs])
+        ax1.plot(grid, np.median(interp, axis=0), color=col, lw=2.2, label=label)
+        ax1.fill_between(grid, np.percentile(interp, 25, axis=0),
+                         np.percentile(interp, 75, axis=0), color=col, alpha=0.15)
+    ax1.set_xlabel("environment steps during learning")
+    ax1.set_ylabel("cumulative constraint-violating steps")
+    ax1.set_title(f"Violations incurred while learning — {scenario}")
+    ax1.grid(alpha=0.3); ax1.legend(fontsize=8, loc="upper left")
+
+    labels = list(totals)
+    y = np.arange(len(labels))
+    ax2.barh(y, [_median(totals[l]) for l in labels],
+             xerr=[_mad(totals[l]) for l in labels], color=[colors[l] for l in labels],
+             alpha=0.85, error_kw={"elinewidth": 1, "capsize": 3})
+    ax2.set_yticks(y); ax2.set_yticklabels(labels, fontsize=8); ax2.invert_yaxis()
+    ax2.set_xlabel("total violated steps during learning (median ± MAD)")
+    ax2.set_title("Training-time safety cost"); ax2.grid(alpha=0.3, axis="x")
+    fig.suptitle(f"Training-time safety (C1) — {scenario}", fontsize=12)
+    fig.tight_layout()
+    path = os.path.join(out_dir, "training_safety.png")
+    fig.savefig(path, dpi=130); plt.close(fig)
+
+    with open(os.path.join(out_dir, "training_safety_summary.csv"), "w",
+              newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["condition", "n_seeds", "total_violations_median",
+                    "total_violations_mad", "plant_interactions_during_learning"])
+        for l in labels:
+            w.writerow([l, len(totals[l]), f"{_median(totals[l]):.2f}",
+                        f"{_mad(totals[l]):.2f}", interactions[l]])
+    print(f"  training-safety -> {path}")
+    return path
+
+
 def plot_training_curve(run_dir: str, out_path: str | None = None) -> str:
     """Learning curve(s) from a run's training_log.npz — mode-specific (offline:
     eval return + violation vs grad step; o2o/online: behaviour return + violation

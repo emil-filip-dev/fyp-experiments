@@ -134,7 +134,10 @@ def analyse_grid(grid: ExperimentGrid, *, output_rollouts: str = "outputs/rollou
     `takeover_maps`) render the RL–MPC takeover-map evolution for one representative
     seed per (scenario, condition). If `rollout_dirs` is None, analyse the newest
     rollout dir per scenario in the grid."""
-    from analysis import analyse_rollout_dir, latest_rollout_dir, plot_takeover_map
+    from collections import defaultdict
+
+    from analysis import (analyse_rollout_dir, latest_rollout_dir,
+                          plot_takeover_map, plot_training_safety)
 
     if rollout_dirs is None:
         scenarios = {e.name for e in grid.envs}
@@ -149,6 +152,24 @@ def analyse_grid(grid: ExperimentGrid, *, output_rollouts: str = "outputs/rollou
             analyse_rollout_dir(d)
         except Exception:
             print(f"  [analyse skip] {d}")
+            traceback.print_exc()
+
+    # Training-time safety (C1): cumulative violations incurred while learning,
+    # per scenario, written alongside the deployment figures.
+    by_scn: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    for ref in iter_model_refs(grid, output_dir=output_models):
+        run_dir = os.path.dirname(ref.checkpoint)
+        if os.path.exists(os.path.join(run_dir, "training_log.npz")):
+            by_scn[ref.scenario][ref.condition.label].append(run_dir)
+    for scenario, cond_map in by_scn.items():
+        try:
+            out_dir = os.path.join(latest_rollout_dir(scenario, root=output_rollouts), "analysis")
+        except FileNotFoundError:
+            out_dir = os.path.join("outputs", "analysis", scenario)
+        try:
+            plot_training_safety(cond_map, scenario, out_dir)
+        except Exception:
+            print(f"  [training-safety skip] {scenario}")
             traceback.print_exc()
 
     if not takeover_maps:
