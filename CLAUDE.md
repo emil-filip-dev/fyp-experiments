@@ -130,10 +130,12 @@ only *locate* files.
     env records `info["cons_info"]` and the do-mpc oracle enforces them as hard state bounds;
     also mirrored in a `constraint_spec` (list of dicts: `state_idx`/`bound`/`type`/`name`/`label`/
     `unit`) that the eval pipeline uses for its own `env.state`-based detection (see `constraints.py`).
-    `cstr` is **verbatim PC-Gym** (T ∈ [321,327] K, from the constraint_showcase); `four_tank`
-    (h3,h4 ≤ 0.6 m overflow), `multistage` (X5 ≤ 0.5 off-spec), `crystallization` (Conc ≥ 0.11
-    over-depletion) are **OURS**, physically-calibrated so nominal control stays inside while
-    exploration crosses them — full justification in `constraints_rationale.md`.
+    `cstr` is **PC-Gym-derived** (T ∈ [319,331] K, from PC-Gym's constraints guide — NOT the
+    constraint_showcase's tighter 321..327, which excludes the verbatim x0 T0=330 K and forces
+    even the oracle to violate; 319..331 contains x0 with ~4.5 K headroom); `four_tank`
+    (h3,h4 ≤ 0.55 m high-level, 0.05 m below the 0.6 m tank top), `multistage` (X5 ≤ 0.5 off-spec),
+    `crystallization` (Conc ≥ 0.11 over-depletion) are **OURS**, physically-calibrated so nominal
+    control stays inside while exploration crosses them — full justification in `constraints_rationale.md`.
 
 - `models.py` — agents + deployment + NMPC, one shared PyTorch core.
   - **Building blocks**: `Actor` (deterministic π(s)→action), `Critic` (single Q, DDPG),

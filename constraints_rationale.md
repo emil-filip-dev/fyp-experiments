@@ -9,12 +9,21 @@ verbatim-copy doctrine in `CLAUDE.md`.
 ## Background: why only the CSTR was constrained out of the box
 
 PC-Gym ships an explicit, environment-specific constraint for **exactly one**
-environment — the CSTR (a reactor-temperature band) — in its
-`pc-gym_paper/constraint_showcase/`. That showcase exists to demonstrate the
-constraint *feature*; it is not a claim that the other processes are
-unconstrained. We copied the CSTR constraint **verbatim**:
+environment — the CSTR (a reactor-temperature band). That constraint exists to
+demonstrate the constraint *feature*; it is not a claim that the other processes
+are unconstrained. PC-Gym states the CSTR band in two places that **disagree**:
+the `pc-gym_paper/constraint_showcase/` code uses 321..327 K, while PC-Gym's
+constraints *guide* uses 319..331 K. We use the **guide's band**:
 
-> `cons = {'T': [327, 321]}`, `cons_type = {'T': ['<=', '>=']}` → **321 K ≤ T ≤ 327 K**.
+> `cons = {'T': [331, 319]}`, `cons_type = {'T': ['<=', '>=']}` → **319 K ≤ T ≤ 331 K**.
+
+We deliberately do **not** use the showcase's tighter 321..327: that band excludes
+the verbatim initial condition (`x0` has T₀ = 330 K, which is *above* 327), so the
+opening transient violates for every controller and even the NMPC oracle is forced
+out of bound (~17% of steps) — i.e. it is not a well-posed constraint for the
+verbatim operating point. The guide's 319..331 band contains `x0` with ~4.5 K of
+headroom, so the oracle is genuinely safe (measured ~0.85% of steps, all at the
+setpoint changes under 0.1% measurement noise) while exploration still crosses it.
 
 For four_tank, multistage_extraction, and crystallization, PC-Gym defines no
 constraint anywhere (training scripts, docs, notebooks, tests). Because the
@@ -67,40 +76,44 @@ The bound was then set between the baseline peak and the reachable extreme.
 
 ---
 
-## 1. four_tank — lower-tank overflow: `h3 ≤ 0.6`, `h4 ≤ 0.6`
+## 1. four_tank — lower-tank high-level alarm: `h3 ≤ 0.55`, `h4 ≤ 0.55`
 
 **Process.** Four interconnected tanks (Johansson, 2000). Two pumps (`v1`, `v2`)
 feed the tanks through a split ratio; the agent controls the two **lower** tank
 levels `h3`, `h4` to setpoints (`h3`: 0.5→0.1, `h4`: 0.2→0.3). State order
 `[h1, h2, h3, h4]` (+ SP slots).
 
-**Hazard: overflow.** The single most obvious safety limit on a tank is that it
-must not overflow. PC-Gym's observation space bounds every level to `[0, 0.6]`
-— i.e. `0.6` is the top of the modelled operating range for each tank, which we
-take as the safe maximum fill level. The tank dynamics are not internally clipped
-to this (levels *can* integrate above it), so exceeding `0.6` is a genuine,
-representable overflow event.
+**Hazard: high level / overflow.** The single most obvious safety limit on a tank
+is that it must not overflow. PC-Gym's observation space bounds every level to
+`[0, 0.6]` — i.e. `0.6` is the top of the modelled operating range (the tank top).
+The dynamics are not internally clipped to this, so a level *can* integrate up
+toward and past it. We place the constraint at **0.55**, a high-level alarm 0.05 m
+below the 0.6 m top, rather than at 0.6 itself.
 
-**Why `0.6` is the right number (calibration).**
+**Why `0.55`, not the 0.6 ceiling (calibration).** Two reasons. (1) **Observability:**
+at 0.6 the normalised observation saturates (`h = 0.6 → obs = 1`), so a bound *at*
+the ceiling is invisible to the agent — it cannot perceive its own proximity or
+overshoot. A bound at 0.55 sits inside the observable range. (2) **Separation:**
 
-| Tank | Baseline peak | Reachable (held max pump) | Bound |
-|------|--------------:|--------------------------:|------:|
-| h3 (controlled to 0.5) | 0.589 | **0.733** | 0.6 |
-| h4 (controlled to 0.3) | 0.337 | 0.414 | 0.6 |
+| Tank | Oracle / offline agent | Sluggish PID | Unguarded exploration | Bound |
+|------|-----------------------:|-------------:|----------------------:|------:|
+| h3 (controlled to 0.5) | < 0.55 | ~0.588 | **~0.68** | 0.55 |
+| h4 (controlled to 0.3) | < 0.55 | ~0.337 | ~0.414 | 0.55 |
 
-The baseline tracks `h3`=0.5 with overshoot to 0.589 — safely under 0.6 — while
-sustained maximum pumping drives `h3` to **0.733**, a clear overflow. So nominal
-control is safe and aggressive control overflows, exactly as required. `h4` never
-approaches 0.6 under any regime; we still bound it because it is the *same
-physical tank ceiling* applied to the other controlled tank (an honest limit that
-simply is not binding here), keeping the constraint set symmetric and physically
-complete.
+The do-mpc oracle (which enforces this bound) and the offline agent hold `h3`
+under 0.55; the sluggish PID baseline overshoots to ~0.588 (so it *does* clip the
+alarm — an honest property of that weak controller, not a safe-reference claim);
+and unguarded exploration drives `h3` to ~0.68. So well-controlled policies stay
+inside while reckless control crosses, which is what the C1 safety claim needs.
+`h4` never approaches 0.55 under any regime; we still bound it because it is the
+*same physical tank ceiling* applied to the other controlled tank (an honest limit
+that simply is not binding here), keeping the constraint set symmetric.
 
-**Appropriateness.** Tank overflow is the textbook safety constraint for level
-control and is the canonical constraint used with the quadruple-tank benchmark.
-The setpoint (0.5) sits comfortably below the bound, so the task and the NMPC
-oracle remain feasible — verified: the oracle solves the full episode with `h3`
-in 0.092–0.526, zero steps out of bound.
+**Appropriateness.** A high-level alarm below the tank top is the textbook safety
+constraint for level control and is the canonical constraint used with the
+quadruple-tank benchmark. The setpoint (0.5) sits below the bound, so the task and
+the NMPC oracle remain feasible — verified: the oracle solves the full episode
+with `h3` in 0.092–0.526, zero steps out of bound.
 
 ---
 
@@ -187,29 +200,34 @@ named unit, so we leave its unit label blank rather than assert one.
 
 | Scenario | Constraint | Hazard | Source | Baseline peak/min | Reachable | C1-active? | Oracle |
 |----------|-----------|--------|--------|------------------:|----------:|-----------:|--------|
-| cstr | 321 ≤ T ≤ 327 K | thermal runaway / quench band | **verbatim PC-Gym** | — | — | yes | enforced |
-| four_tank | h3 ≤ 0.6, h4 ≤ 0.6 | tank overflow | ours | 0.589 / 0.337 | 0.733 | yes (h3) | enforced |
+| cstr | 319 ≤ T ≤ 331 K | thermal runaway / quench band | **PC-Gym guide** | oracle ~0.85% | — | yes | enforced |
+| four_tank | h3 ≤ 0.55, h4 ≤ 0.55 | high level / overflow | ours | PID ~0.588 (clips) | ~0.68 | yes (h3) | enforced |
 | multistage | X5 ≤ 0.5 | off-spec product | ours | 0.474 | 0.585 | yes | enforced |
 | crystallization | Conc ≥ 0.11 | over-depletion | ours | 0.125 | 0.103 | yes | N/A (delta-u) |
 
-Under the saturating-policy proxy (per-episode held random action, 20 seeds) the
-baseline incurred **0%** violations on all three of our constrained scenarios,
-while the proxy incurred 8% (four_tank), 10% (multistage) and 2% (crystallization)
-— confirming each bound separates safe nominal control from hazardous exploration,
-the separation the C1 experiment relies on.
+Each bound is calibrated to separate well-controlled operation from hazardous
+exploration: the NMPC oracle and the offline agent stay inside while saturating /
+unguarded control crosses. The one nuance is four_tank, where the *weak* PID
+baseline itself overshoots the 0.55 alarm (~0.588) — an honest property of that
+sluggish controller, not a failure of the calibration; the oracle and offline
+agent remain inside. Exact per-method violation rates are re-measured every run in
+the safety metrics (`metrics_summary.csv`), not asserted here.
 
 ## Honesty / threats to validity
 
-- **These three bounds are ours, not PC-Gym's.** They are physically principled
-  and envelope-calibrated, but a reviewer should know they were chosen by us; the
-  CSTR band is the only verbatim-PC-Gym constraint.
-- **The CSTR baseline is not violation-free (~10%).** Its verbatim operating
-  point starts at `x0` T=330 K, *above* the verbatim [321, 327] band (PC-Gym's
-  showcase started at 325 K, inside it), so the opening transient violates for
-  every controller. We left both `x0` and the band verbatim; the C1 gradient
-  still holds (baseline well below exploratory violation rates).
+- **Three of the four bounds are ours, not PC-Gym's.** They are physically
+  principled and envelope-calibrated, but a reviewer should know they were chosen
+  by us. The CSTR band is PC-Gym-derived (from PC-Gym's constraints guide, 319..331),
+  not the constraint_showcase's 321..327 — see below.
+- **We use PC-Gym's 319..331 CSTR band, not the showcase's 321..327.** PC-Gym
+  states the band two ways; the showcase's tighter 321..327 excludes the verbatim
+  `x0` (T₀ = 330 K is above 327), so it forces the opening transient — and even the
+  NMPC oracle — out of bound (~17% of steps), which is not a well-posed constraint
+  for the verbatim operating point. The guide's 319..331 contains `x0` with ~4.5 K
+  headroom: the oracle is near-clean (~0.85% of steps, transient noise) and the
+  baseline safe, while exploration still crosses it — a genuine C1 gradient.
 - **Constraint strength varies.** Crystallization produces the weakest signal
   (rare, small-magnitude violations), partly because its P-baseline is itself a
-  weak controller; four_tank's overflow is genuine but only `h3` is near-binding.
-  These are honest properties of the verbatim operating points, not tuning knobs
-  we optimised for effect.
+  weak controller; four_tank's high-level alarm is genuine but only `h3` is
+  near-binding. These are honest properties of the verbatim operating points, not
+  tuning knobs we optimised for effect.

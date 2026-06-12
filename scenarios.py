@@ -24,12 +24,17 @@ env_params (constraints/cons_type/done_on_cons_vio=False/r_penalty=False) so the
 env records info["cons_info"] and, for setpoint-tracking scenarios, the do-mpc
 oracle (models.NMPCController) enforces them as hard state bounds. Each is ALSO
 mirrored in `constraint_spec` for the eval pipeline's own env.state-based
-violation detection (constraints.py / evaluate.py).
-  cstr      : reactor temperature 321 K <= T <= 327 K. VERBATIM from PC-Gym
-              (pc-gym_paper/constraint_showcase: cons={'T':[327,321]},
-              cons_type={'T':['<=','>=']}). Oracle-enforced.
-  four_tank : lower-tank overflow h3 <= 0.6 m, h4 <= 0.6 m. OURS (PC-Gym defines
-              none) — the physical tank height (o_space high). Oracle-enforced.
+violation detection (constraints.py / analysis.py).
+  cstr      : reactor temperature 319 K <= T <= 331 K, from PC-Gym's constraints
+              guide (cons={'T':[331,319]}, cons_type={'T':['<=','>=']}). NOT the
+              constraint_showcase's tighter 321..327 band: that excludes the
+              verbatim x0 (T0=330 K starts above 327) and forces even the NMPC
+              oracle to violate, whereas 319..331 contains x0 with ~4.5 K of
+              headroom. Oracle-enforced.
+  four_tank : lower-tank high-level h3 <= 0.55 m, h4 <= 0.55 m. OURS (PC-Gym
+              defines none) — a high-level alarm 0.05 m below the 0.6 m tank top
+              (the o_space ceiling), kept inside the observable range so the
+              normalised observation does not saturate. Oracle-enforced.
   multistage_extraction : product off-spec X5 <= 0.5 mol/L. OURS. Oracle-enforced.
   crystallization : minimum liquor concentration Conc >= 0.11 kg/kg. OURS. Oracle
               N/A (delta-u action -> NMPCController/run_rollouts skip the oracle);

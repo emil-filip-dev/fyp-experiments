@@ -4,7 +4,7 @@ constraints.py
 Constraint-violation detection and metrics for PC-Gym rollouts.
 
 Two jobs:
-  1. DETECTION (used by evaluate.py at capture time): given recorded physical
+  1. DETECTION (used by deploy.py at capture time): given recorded physical
      states and a scenario's `constraint_spec` (see scenarios.py), compute the
      per-step, per-constraint violation magnitude. We compute this ourselves from
      `env.state` rather than reading PC-Gym's `info["cons_info"]`, which (a) is not
